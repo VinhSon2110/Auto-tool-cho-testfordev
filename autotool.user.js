@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tu Tiên - Auto Tool
 // @namespace    autoboss.tutien
-// @version      2.45.2
+// @version      2.56.0
 // @description  Tự động đánh boss, U Minh Cốc, săn yêu, leo tháp, tầm bảo và xuất hồn (ưu tiên: đột phá > boss > U Minh Cốc > săn yêu > leo tháp > tầm bảo > xuất hồn), kèm luyện đan, linh điền, yêu thú, đổi chiêu, đan hồi HP/MP và ngưỡng HP/MP theo từng chế độ; chỉ dùng chiêu (ưu tiên khắc hệ), tự hồi máu/chờ MP; hàng chờ giữ nhịp ~1 lệnh/giây; giao diện máy tính và màn hình nhỏ cảm ứng
 // @match        https://www.testfordev.online/*
 // @match        https://testfordev.online/*
@@ -10,7 +10,7 @@
 // ==/UserScript==
 
 /*
- * KIẾN TRÚC (cập nhật tới v2.45.2). Thứ tự trong file đi từ lớp thuần tới lớp phụ thuộc DOM / mạng:
+ * KIẾN TRÚC (cập nhật tới v2.56.0). Thứ tự trong file đi từ lớp thuần tới lớp phụ thuộc DOM / mạng:
  *
  *  1. Domain (thuần, không side-effect)  : ElementRules, SkillSelector, CombatFormatter, BossCatalog (chọn boss + chế độ nâng cao theo cỡ boss: full / min70 / dmg50 / dmg25), MonsterCatalog, PillCatalog, AlchemyCatalog,
  *                                          SkillCatalog (sách chiêu; đọc định dạng mới skill_id + effects[] và suy ra skill_kind / mp_cost / hệ cho phần còn lại),
@@ -21,11 +21,11 @@
  *                                          PillConfig (cấu hình dự phòng cho nút "Hồi MP ngay"),
  *                                          RequestQueue (hàng chờ lệnh gọi game: hai lệnh cách nhau >= REQ_GAP_MS (~1s), 3 mức ưu tiên + nâng mức khi chờ lâu, gộp GET trùng, dừng khi server báo gọi quá nhiều)
  *  3. Dịch vụ dùng chung                 : Healer (dưỡng thương), PillManager (đan hồi MP theo chế độ + nút Hồi MP ngay), HpPillService (đan hồi HP theo chế độ + nút Hồi HP ngay),
- *                                          SkillSwapper (tự đổi chiêu khắc hệ, chỉ trước boss)
+ *                                          SkillSwapper (tự đổi chiêu khắc hệ, trước boss / săn yêu / tầm bảo)
  *  4. Engine (mỗi chế độ = 1 class)      : Engine (abstract)
- *                                            ├─ BossEngine, BreakthroughEngine, AlchemyEngine, BeastEngine, GardenEngine, XuatHonEngine, WarEngine (Tông Chiến, vòng lặp thường, không dùng MatchEngine)
+ *                                            ├─ BossEngine, BreakthroughEngine, AlchemyEngine, BeastEngine, GardenEngine, XuatHonEngine, MeridianEngine (luyện thể: chạy ngầm, 1 mạch, luyện huyệt rẻ nhất), PetEngine (vuốt ve yêu thú xuất chiến, chờ hồi 1 giờ), WarEngine (Tông Chiến, vòng lặp thường, không dùng MatchEngine)
  *                                            └─ MatchEngine (khung trận đánh dùng chung: waitGate = ngưỡng HP / MP trước khi mở trận hoặc vào U Minh, waitMp = hết MP giữa trận)
- *                                               → FarmEngine (tầm bảo), HuntEngine (săn yêu), TowerEngine (leo tháp), UMinhEngine (U Minh Cốc)
+ *                                               → FarmEngine (tầm bảo), HuntEngine (săn yêu), TowerEngine (leo tháp), UMinhEngine (U Minh Cốc), PvpEngine (đấu pháp)
  *       Đi kèm trong phần này: WarCatalog (chọn lãnh địa, lọc mục tiêu, mốc xx:25 và 20:55), BreakthroughCatalog, BeastCatalog, XuatHonCatalog, AutoLogin, ModeMemory (nhớ chế độ để tự bật lại), BulkUseCatalog / BulkUseEngine (mở nhiều), SellCatalog / SellEngine (bán đồ)
  *       - Engine KHÔNG đụng DOM: chỉ phát sự kiện 'log' | 'start' | 'stop' | 'state' | 'status' | 'tickets' (và vài sự kiện riêng của từng chế độ)
  *       - Vòng lặp chính và vòng lặp trận đánh là các StateMachine (bảng chuyển trạng thái khai báo rõ ràng, vd. XuatHonEngine.TRANSITIONS)
@@ -42,6 +42,10 @@
  *                                          lệnh đổi chiêu chờ (queueSkill / flushSkillQueue), điều kiện chạy của xuất hồn (xhBlockers)
  *
  *  THỨ TỰ ƯU TIÊN (Coordinator): đột phá > boss > U Minh Cốc > săn yêu > leo tháp > tầm bảo > xuất hồn.
+ *  - Tông Chiến: lãnh địa của tông = đang chiếm (ownerSectId; server không ghi đăng ký cho bên chiếm) + đã đăng ký được duyệt. Quét lúc bật, mỗi xx:25, lúc tới giờ tập hợp, mỗi phút nếu chưa thấy lãnh địa nào; log đã có / sẽ chiếm / bị tông khác chuẩn bị chiếm.
+ *  - Đấu pháp (PvpEngine) chạy ngầm ở mức thấp nhất: nhường boss / đột phá / U Minh Cốc / săn yêu / leo tháp và trận tầm bảo đang dở, không nhường theo "tầm bảo đang bật" (tầm bảo hết vé vẫn bật mãi).
+ *    Chỉ đánh chế độ challenge (tính Elo, không phạt karma), cách nhau PVP_GAP_MS (game bắt >= 15s; PVP_COOLDOWN không làm dừng hàng chờ). Đối thủ: cấp <= cấp mình - chênh cấp, điểm cao nhất.
+ *    Đủ số trận đã đặt thì tự tắt. Cờ coord.pvpBattle chặn đổi chiêu / đột phá trong lúc đấu.
  *  - Boss chiếm 3 phút đầu mỗi giờ; đột phá chen vào giữa các trận (btPause) và có thể đợi trận đang dở.
  *  - Còn boss và đang bật chế độ boss (coord.bossPending): U Minh Cốc không vào và không mở lượt mới, vì trong U Minh HP, MP không tự hồi theo thời gian (đan vẫn dùng được).
  *  - Chế độ nâng cao của từng cỡ boss (BossEngine.st.modes, lưu localStorage, mặc định full = đánh tới cùng):
@@ -55,14 +59,14 @@
  *  - Ngưỡng HP / MP (mỗi chế độ, mỗi ngưỡng một ô bật / tắt): HP hoặc MP <= mức tạm dừng thì không mở trận mới (U Minh Cốc: không vào); dùng đan của chế độ đó
  *    (nếu bật) tới ít nhất mức chạy tiếp, không có đan thì chờ tự hồi, kiểm tra lại mỗi 2 phút, chạy tiếp khi vượt mức chạy tiếp. Boss không có ngưỡng này.
  *  - Đổi chiêu: lệnh bị hoãn khi đang trong trận; các chế độ gọi coord.skillGate() giữa hai trận để đổi ngay trước khi mở trận mới.
- *  - Tự đổi chiêu khắc hệ (SkillSwapper + SkillCatalog.plan) chỉ chạy trước boss: bộ chiêu đang gắn đã có chiêu công kích khắc thì giữ nguyên; nếu chưa có thì mới tìm
- *    trong chiêu dự bị (ô "Chiêu dùng để thay"), trống thì không tìm. Đổi tối thiểu (còn ô trống chỉ gắn thêm, hết ô thì tháo 1 chiêu yếu nhất rồi gắn);
- *    gắn lỗi sau khi đã tháo thì gắn lại chiêu vừa tháo. Leo tháp không đổi chiêu.
+ *  - Tự đổi chiêu khắc hệ (SkillSwapper + SkillCatalog.plan) chạy trước U Minh Cốc (hệ quái theo cảnh giới, CFG.UM_ELEMENT_BY_REALM), boss, săn yêu (hệ quái đã chọn) và tầm bảo (hệ con có monsterId lớn nhất của bí cảnh, lấy từ /api/dungeon/farm/zones/<code>/monsters; Engine.swapBeforeMatch: không lấy được hệ thì tải lại 3 lần, quá thì tạm dừng 60 phút rồi làm lại): bộ chiêu đang gắn đã có chiêu công kích khắc thì giữ nguyên; nếu chưa có thì mới tìm
+ *    trong ô dự bị CỐ ĐỊNH của hệ khắc (6 ô: Kim/Mộc/Thủy/Hỏa/Thổ công kích + 1 hồi máu; chỉ đổi khi bạn chọn, tool/game đổi chiêu không làm đổi ô dự bị), ô trống thì giữ bộ chiêu và ghi log. Nếu bộ chiêu không có chiêu hồi máu mà ô hồi máu có chiêu thì gắn thêm. Đổi tối thiểu (còn ô trống chỉ gắn thêm, hết ô thì tháo 1 chiêu không khắc yếu nhất rồi gắn);
+ *    gắn lỗi sau khi đã tháo thì gắn lại chiêu vừa tháo. Leo tháp, U Minh Cốc, Tông Chiến không dùng cách này.
  *  - Tông Chiến (WarEngine, chỉ chạy khi bật; trận mô phỏng nên không đụng HP thật, không xung đột với các chế độ khác): trước gatherAt chờ; từ gatherAt đổi chiêu một lần
  *    (SkillSwapper.ensureWar + SkillCatalog.planWar: 1 chiêu hồi máu mạnh nhất + các chiêu công kích mạnh nhất, vì server chụp bộ chiêu lúc POST garrison và khóa tới hết sự kiện,
  *    đổi giữa trận vô ích) rồi vào lãnh địa; trong khung liveStartAt - liveEndAt mỗi lượt: người chơi khác tông có power <= CFG.WAR_MAX_POWER (không giới hạn lượt, yếu nhất trước)
  *    > thủ vệ (guard.remaining > 0, tối đa 5 lần thắng) > chờ người chơi xuất hiện. Một lượt = POST attack mở trận + POST match/action lặp tới finished. Chờ nextActionAt / woundedUntil
- *    giữa các lượt; dừng khi hết giờ live hoặc attacksMade >= limits.maxAttacks. Lãnh địa: chỉ liệt kê lãnh địa tông đã đăng ký, mặc định vòng cao trước (center > middle > outer),
+ *    giữa các lượt; dừng khi hết giờ live hoặc attacksMade >= limits.maxAttacks. Lãnh địa: liệt kê lãnh địa tông đang chiếm + đã đăng ký; mặc định chọn lãnh địa CHƯA có (sẽ chiếm) trước lãnh địa đang chiếm, rồi vòng cao (center > middle > outer),
  *    quét khi bật và mỗi xx:25; lựa chọn tay được giữ tới 20:55 rồi về mặc định (lưu localStorage). Đã garrison thì lãnh địa lấy từ me.garrison.
  *  - Hàng chờ lệnh (RequestQueue): ưu tiên 0 = boss, đột phá, đổi chiêu; 1 = tầm bảo, săn yêu, leo tháp, U Minh Cốc, Tông Chiến, thông tin nhân vật; 2 = việc nền (bán đồ, mở rương, ấp trứng...).
  *    Lệnh chờ quá REQ_AGING_MS thì được nâng một mức. Gặp 429 / "too many requests": dừng hàng REQ_PAUSE_MS rồi gửi lại đúng 1 lần.
@@ -70,7 +74,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.45.2'; // phải khớp với @version ở trên; nhớ tăng khi có thay đổi mới
+  const VERSION = '2.56.0'; // phải khớp với @version ở trên; nhớ tăng khi có thay đổi mới
 
   /* ===================== CẤU HÌNH ===================== */
   const CFG = {
@@ -144,9 +148,16 @@
     SELL_MAX_PER_CALL: 999, SELL_CALL_GAP_MS: 1200, // bán đồ: mỗi lệnh tối đa chừng này, nghỉ giữa các lệnh
     CHEST_BATCH_MAX: 300,            // mở nhiều: mỗi lệnh dùng tối đa chừng này vật phẩm
     CHEST_CALL_GAP_MS: 1200,         // mở nhiều: nghỉ giữa các lượt
-    BEAST_CAP: 20, BEAST_HATCH_MAX: 15, BEAST_CALL_GAP_MS: 1200, BEAST_POLL_MS: 3600000,
+    BEAST_CAP: 20, BEAST_RELEASE_BULK_MAX: 20, BEAST_HATCH_MAX: 20, BEAST_CALL_GAP_MS: 1200, BEAST_POLL_MS: 3600000,
     // Linh điền: quét lại sau (thời gian còn lại ngắn nhất + EXTRA) để cả đợt cùng chín; không đủ linh thạch thì thử lại sau NOSTONE
     GARDEN_DEFAULT_SEED: 'Hạt Băng Tinh Thảo', GARDEN_EXTRA_WAIT_MS: 30000, GARDEN_NOSTONE_POLL_MS: 120000, GARDEN_CALL_GAP_MS: 500,
+    PREMATCH_RETRIES: 3, PREMATCH_RETRY_MS: 3000, PREMATCH_PAUSE_MS: 3600000, // đổi chiêu trước trận săn yêu / tầm bảo: tải lại hệ tối đa 3 lần (cách 3s), quá thì tạm dừng 60 phút rồi làm lại từ đầu
+    PET_CALL_GAP_MS: 1200, PET_IDLE_POLL_MS: 300000, PET_EXTRA_WAIT_MS: 3000, PET_MAX_INTIMACY: 100, // Vuốt ve yêu thú: nghỉ giữa các lệnh; không có con nào xuất chiến thì kiểm tra lại sau 5 phút; chờ thêm sau khi hết hồi; thân mật đủ thì thôi
+    UM_ELEMENT_BY_REALM: { 6: 'Thổ', 7: 'Hỏa', 8: 'Thủy' }, // U Minh Cốc: hệ quái theo cảnh giới (realm_id; Luyện Hư 6, Hợp Thể 7, Đại Thừa 8). Cảnh giới khác chưa biết hệ thì không đổi chiêu
+    WAR_NOTERR_SCAN_MS: 60000, // Tông Chiến: chưa thấy lãnh địa nào của tông thì quét lại mỗi phút (thay vì mỗi giờ)
+    PVP_GAP_MS: 16000, PVP_DEFAULT_COUNT: 10, PVP_DEFAULT_LEVEL_GAP: 10, PVP_LEVELS_PER_REALM: 9, PVP_LOSS_STREAK: 3, PVP_LOSS_PAUSE_MS: 1800000, // Đấu pháp: nghỉ giữa 2 lần thách đấu (game bắt >= 15s); số trận mặc định; đối thủ phải thấp hơn mình từng này cấp; thua liên tiếp chừng này trận thì nghỉ
+    STRIP_FOLD_OVER: 3, // thanh trạng thái: chạy nhiều hơn số chế độ này thì gộp thành 1 nút
+    MERIDIAN_POOR_POLL_MS: 300000, MERIDIAN_EXTRA_WAIT_MS: 3000, // Luyện thể: thiếu đá / tu vi thì thử lại sau 5 phút; chờ thêm sau khi hết giờ luyện
     XH_DEFAULT_DURATION: 5,          // xuất hồn: mức thời gian mặc định (phút); các mức khác lấy từ server (5 / 10 / 20 / 60)
     XH_MIN_BEFORE_HOUR_MIN: 5,       // xuất hồn: còn ít hơn max(5, mức đã chọn) phút tới đầu giờ thì không bắt đầu lượt mới
     XH_IDLE_MS: 15000,               // xuất hồn: đang chờ U Minh Cốc / tầm bảo xong thì kiểm tra lại mỗi chừng này
@@ -170,11 +181,10 @@
   };
 
   /* ===================== HẰNG SỐ DOMAIN ===================== */
-  const SINH = { 'Mộc': 'Hỏa', 'Hỏa': 'Thổ', 'Thổ': 'Kim', 'Kim': 'Thủy', 'Thủy': 'Mộc' };
   const KHAC = { 'Kim': 'Mộc', 'Mộc': 'Thổ', 'Thổ': 'Thủy', 'Thủy': 'Hỏa', 'Hỏa': 'Kim' };
   const SIZE_ORDER = { small: 0, medium: 1, large: 2 };
   const SIZE_NAME = { small: 'Nhỏ', medium: 'Trung', large: 'Đại' };
-  const REL_NAME = { khac: 'khắc', neutral: 'thường', sinh: 'sinh', heal: 'hồi máu' };
+  const REL_NAME = { khac: 'khắc', neutral: 'thường', giam: 'bị giảm', heal: 'hồi máu' };
   const ZONES = [
     ['luyen_khi', 'Luyện Khí'], ['truc_co', 'Trúc Cơ'], ['kim_dan', 'Kim Đan'], ['nguyen_anh', 'Nguyên Anh'],
     ['hoa_than', 'Hóa Thần'], ['luyen_hu', 'Luyện Hư'], ['hop_the', 'Hợp Thể'], ['dai_thua', 'Đại Thừa'],
@@ -187,15 +197,16 @@
    * ===================================================================== */
 
   class ElementRules {
-    // khac: chiêu khắc boss (+15%) | sinh: chiêu sinh ra hệ của boss (-15%, vd skill Mộc đánh boss Hỏa)
-    // neutral: mọi trường hợp còn lại (không liên quan, cùng hệ, boss sinh chiêu, boss khắc chiêu: game không phạt)
+    // Bảng ngũ hành của game (chiều khắc Kim → Mộc → Thổ → Thủy → Hỏa → Kim):
+    // khac: chiêu khắc hệ của quái / boss (tăng ATK) | giam: hệ của quái / boss khắc chiêu (giảm ATK, vd chiêu Kim đánh quái Hỏa)
+    // neutral: mọi trường hợp còn lại (không liên quan, cùng hệ): bình thường
     static relation(skillEl, bossEl) {
       if (KHAC[skillEl] === bossEl) return 'khac';
-      if (SINH[skillEl] === bossEl) return 'sinh';
+      if (KHAC[bossEl] === skillEl) return 'giam';
       return 'neutral';
     }
   }
-  ElementRules.RANK = { khac: 3, neutral: 2, sinh: 0 };
+  ElementRules.RANK = { khac: 3, neutral: 2, giam: 0 };
 
   class SkillSelector {
     // HP đang thấp (còn sống nhưng < HEAL_BELOW_PCT HP tối đa)? Cần biết cả hp lẫn hpMax.
@@ -203,13 +214,13 @@
       return typeof hp === 'number' && hpMax > 0 && hp > 0 && hp / hpMax < CFG.HEAL_BELOW_PCT;
     }
 
-    // Chọn chiêu: ưu tiên chiêu khắc > chiêu không tương sinh. Không có chiêu phù hợp thì trả null (không dùng đánh thường).
+    // Chọn chiêu: ưu tiên chiêu khắc > chiêu bình thường > chiêu bị giảm ATK. Không có chiêu phù hợp thì trả null (không dùng đánh thường).
     static pickAttack(skills, bossEl, mp) {
       let best = null;
       for (const s of skills || []) {
         if (s.type && s.type !== 'attack') continue;
         if (typeof mp === 'number' && s.mp_cost > mp) continue;
-        const rel = ElementRules.relation(s.element, bossEl); // khắc > neutral > sinh: chiêu sinh (-15%) chỉ dùng khi không còn chiêu nào khác
+        const rel = ElementRules.relation(s.element, bossEl); // khắc > bình thường > giảm: chiêu bị giảm ATK chỉ dùng khi không còn chiêu nào khác
         const score = ElementRules.RANK[rel] * 1000 + (s.damage_multiplier || 0);
         if (!best || score > best.score) best = { skill: s, rel, score };
       }
@@ -244,7 +255,7 @@
       return (skills || []).filter(s => (!s.type || s.type === 'attack'));
     }
 
-    // 'mp' (có chiêu hợp hệ nhưng thiếu MP, chờ MP hồi là đánh tiếp được) hay 'element' (chỉ còn chiêu tương sinh / chưa trang bị)
+    // 'mp' (có chiêu hợp hệ nhưng thiếu MP, chờ MP hồi là đánh tiếp được) hay 'element' (chỉ còn chiêu bị giảm ATK / chưa trang bị)
     static noSkillCause(skills, bossEl, mp) {
       return SkillSelector.usableAttacks(skills, bossEl).length && typeof mp === 'number' ? 'mp' : 'element';
     }
@@ -283,7 +294,7 @@
       const fmt = CombatFormatter.fmtPct;
       const head = o.heal
         ? `(${REL_NAME.heal}) ${o.name}: HP ${o.hp}/${o.hpMax}`
-        : `${o.rel === 'sinh' ? '⚠ ' : ''}(${REL_NAME[o.rel] || o.rel}) ${o.name}: -${o.dealt ?? '?'}`; // ⚠ = chiêu tương sinh, dùng vì không còn chiêu khác
+        : `${o.rel === 'giam' ? '⚠ ' : ''}(${REL_NAME[o.rel] || o.rel}) ${o.name}: -${o.dealt ?? '?'}`; // ⚠ = chiêu bị giảm ATK, dùng vì không còn chiêu khác
       const foe = typeof o.foeHp !== 'number' ? ''
         : o.foeMax > 0 ? ` (${o.foeHp}/${o.foeMax} - ${fmt(o.foeHp, o.foeMax)})` : ` (còn ${o.foeHp} HP)`;
       const mine = o.hpMax > 0 ? ` (còn ${fmt(o.hp, o.hpMax)} HP)` : (typeof o.hp === 'number' ? ` (HP ${o.hp})` : '');
@@ -459,42 +470,50 @@
       return SkillCatalog.all(inv).filter(x => !x.is_equipped).sort(SkillCatalog.byMp);
     }
     static kindName(k) { return SkillCatalog.KIND[k] || k || '?'; }
-    // Kế hoạch đổi chiêu trước boss để khắc hệ `el`. Trả { actions: [{ op: 'unequip' | 'equip', item }], reason, add: [..] }.
-    //  ok     = đang mang sẵn ít nhất 1 chiêu công kích khắc `el` (hoặc không biết hệ) → không đổi, không tìm chiêu dự bị.
-    //  nopool = đang mang không có chiêu khắc nhưng chưa chọn chiêu dự bị ("Chiêu dùng để thay" trống) → không tìm, giữ nguyên.
-    //  none   = chiêu dự bị không có chiêu công kích khắc nào dùng được (đủ cảnh giới, chưa gắn) → giữ nguyên.
-    //  locked = có chiêu khắc dự bị nhưng ô đầy và không tháo được chiêu nào (khóa 🔒 / chỉ còn 1 chiêu hồi máu) → giữ nguyên.
-    //  swap   = đổi tối thiểu: còn ô trống thì chỉ gắn chiêu khắc mạnh nhất trong dự bị; hết ô thì tháo 1 chiêu yếu nhất rồi gắn.
-    //  Chiêu bị tháo (ưu tiên): công kích không khắc (hệ 'sinh' trước, rồi sát thương thấp nhất) > chiêu khác không phải hồi máu > hồi máu (chỉ khi đang mang ≥ 2 chiêu hồi máu).
-    //  opts.pool  = Set id (inventory id) chiêu dự bị
-    //  opts.slots = số ô chiêu tối đa (mặc định CFG.SKILL_SLOTS)
-    //  opts.locked = Set id các chiêu bị khóa: không bao giờ tháo
+    // Chiêu dự bị CỐ ĐỊNH (không tự xoay, chỉ đổi khi bạn chọn): mỗi hệ Kim/Mộc/Thủy/Hỏa/Thổ 1 chiêu công kích + 1 chiêu hồi máu.
+    // pool = { Kim: id, Mộc: id, Thủy: id, Hỏa: id, Thổ: id, heal: id }, 0 / thiếu = chưa chọn.
+    static get POOL_KEYS() { return ['Kim', 'Mộc', 'Thủy', 'Hỏa', 'Thổ', 'heal']; }
+    static normPool(o) { return Object.fromEntries(SkillCatalog.POOL_KEYS.map(k => [k, Number(o && o[k]) || 0])); }
+    // Kế hoạch đổi chiêu trước boss hệ `el`. Trả { actions: [{ op: 'unequip' | 'equip', item }], reason, healReason, add }.
+    //  Chiêu công kích (reason): ok = đang mang chiêu công kích khắc `el` (hoặc không biết hệ) | nopool = ô dự bị của hệ khắc `el` chưa chọn |
+    //   none = chiêu dự bị đó không dùng được (không còn, chưa đủ cảnh giới, không phải chiêu công kích) | locked = ô đầy và không tháo được chiêu nào | swap = có đổi.
+    //  Chiêu hồi máu (healReason): ok = đã mang chiêu hồi máu hoặc ô dự bị hồi máu trống (không báo) | none / locked / swap như trên.
+    //  Đổi tối thiểu: còn ô trống thì chỉ gắn thêm; hết ô thì tháo 1 chiêu. Chiêu bị tháo (ưu tiên): công kích không khắc (chiêu bị giảm ATK trước, rồi sát thương thấp nhất) >
+    //  chiêu khác không phải hồi máu > hồi máu (chỉ khi đang mang ≥ 2 chiêu hồi máu). Chiêu bị tháo không ảnh hưởng ô dự bị (cố định).
+    //  opts.pool = ô dự bị | opts.slots = số ô chiêu tối đa | opts.locked = Set id chiêu khóa 🔒 (không bao giờ tháo)
     static plan(inv, el, realm, opts = {}) {
       const all = SkillCatalog.all(inv).filter(x => x.is_equippable !== 0 && x.is_equippable !== false);
       const isAtk = x => x.skill_kind === 'attack';
       const rel = x => ElementRules.relation(x.skill_element, el);
       const mult = x => Number(x.skill_damage_multiplier) || 0;
       const byDmg = (a, b) => mult(b) - mult(a) || (a.skill_mp_cost || 0) - (b.skill_mp_cost || 0);
+      const slots = opts.slots > 0 ? opts.slots : CFG.SKILL_SLOTS, locked = opts.locked || new Set(), recent = opts.recent || new Set(), pool = SkillCatalog.normPool(opts.pool);
       const eq = all.filter(x => x.is_equipped);
-      if (!el || eq.some(x => isAtk(x) && rel(x) === 'khac')) return { actions: [], reason: 'ok', add: [] };
-      const pool = opts.pool && opts.pool.size ? opts.pool : null;
-      if (!pool) return { actions: [], reason: 'nopool', add: [] };
-      const best = all.filter(x => !x.is_equipped && pool.has(x.id) && (realm == null || (x.required_realm || 0) <= realm) && isAtk(x) && rel(x) === 'khac').sort(byDmg)[0];
-      if (!best) return { actions: [], reason: 'none', add: [] };
-      const slots = opts.slots > 0 ? opts.slots : CFG.SKILL_SLOTS;
-      const actions = [];
-      if (eq.length >= slots) {
-        const free = eq.filter(x => !(opts.locked && opts.locked.has(x.id)));
-        const nonKhacAtk = free.filter(x => isAtk(x) && rel(x) !== 'khac').sort((a, b) => ((rel(b) === 'sinh') - (rel(a) === 'sinh')) || byDmg(b, a));
-        const other = free.filter(x => !isAtk(x) && x.skill_kind !== 'heal').sort((a, b) => byDmg(b, a));
-        const heals = eq.filter(x => x.skill_kind === 'heal');
-        const healFree = heals.length >= 2 ? free.filter(x => x.skill_kind === 'heal').sort((a, b) => byDmg(b, a)) : [];
-        const victim = nonKhacAtk[0] || other[0] || healFree[0];
-        if (!victim) return { actions: [], reason: 'locked', add: [] };
-        actions.push({ op: 'unequip', item: victim });
+      const usable = id => all.find(x => x.id === id && !x.is_equipped && (realm == null || (x.required_realm || 0) <= realm));
+      const out = { actions: [], reason: 'ok', healReason: 'ok', add: [] };
+      const needs = [];
+      if (el && !eq.some(x => isAtk(x) && rel(x) === 'khac')) {
+        const key = Object.keys(KHAC).find(k => KHAC[k] === el), item = key && pool[key] ? usable(pool[key]) : null;
+        if (!key || !pool[key]) out.reason = 'nopool'; else if (!item || !isAtk(item)) out.reason = 'none'; else needs.push({ item, field: 'reason' });
       }
-      actions.push({ op: 'equip', item: best });
-      return { actions, reason: 'swap', add: [best] };
+      if (pool.heal && !eq.some(x => x.skill_kind === 'heal')) {
+        const item = usable(pool.heal);
+        if (!item || item.skill_kind !== 'heal') out.healReason = 'none'; else needs.push({ item, field: 'healReason' });
+      }
+      let free = slots - eq.length, cand = eq.filter(x => !locked.has(x.id));
+      for (const n of needs) {
+        if (free > 0) free--;
+        else {
+          const nonKhacAtk = cand.filter(x => isAtk(x) && rel(x) !== 'khac').sort((a, b) => ((rel(b) === 'giam') - (rel(a) === 'giam')) || byDmg(b, a));
+          const other = cand.filter(x => !isAtk(x) && x.skill_kind !== 'heal').sort((a, b) => byDmg(b, a));
+          const healFree = eq.filter(x => x.skill_kind === 'heal').length >= 2 ? cand.filter(x => x.skill_kind === 'heal').sort((a, b) => byDmg(b, a)) : [];
+          const victim = nonKhacAtk.find(x => !recent.has(x.id)) || nonKhacAtk[0] || other[0] || healFree[0]; // chiêu công kích vừa gắn ở lần đổi trước (recent) để lại, tháo chiêu khác: xoay vòng thay vì gắn / tháo đi tháo lại cùng một chiêu
+          if (!victim) { out[n.field] = 'locked'; continue; }
+          out.actions.push({ op: 'unequip', item: victim }); cand = cand.filter(x => x !== victim);
+        }
+        out.actions.push({ op: 'equip', item: n.item }); out.add.push(n.item); out[n.field] = 'swap';
+      }
+      return out;
     }
     // Kế hoạch đổi chiêu trước Tông Chiến (server chụp bộ chiêu lúc vào lãnh địa, sau đó không đổi được): 1 chiêu hồi máu mạnh nhất + các chiêu công kích
     // mạnh nhất (hệ không quan trọng vì đối thủ không có hệ), đủ số ô. Chiêu khóa 🔒 đang mang thì giữ. Trả { actions: [{ op, item }], reason: 'ok' | 'swap' }.
@@ -513,27 +532,6 @@
         ...want.filter(x => !x.is_equipped).map(item => ({ op: 'equip', item })),
       ];
       return { actions, reason: actions.length ? 'swap' : 'ok' };
-    }
-    // Xoay ô dự bị: chiêu `added[i]` vừa được gắn thay cho chiêu `removed[i]` (ghép theo thứ tự, không phân biệt loại chiêu).
-    // Nếu chiêu vừa gắn đang nằm trong ô dự bị thì ô đó đổi thành chiêu vừa bị tháo (giữ nguyên vị trí). Không đổi khi chiêu nào trong cặp bị khóa 🔒,
-    // chiêu bị tháo không phải công kích / hồi máu (droplist không có), hoặc chiêu bị tháo đã nằm trong ô dự bị khác.
-    // Trả { pool: [id...], changes: [{ from, to }] }; pool rỗng (= dùng mọi chiêu) thì không đổi gì.
-    static rotatePool(added, removed, pool, locked) {
-      const out = [...(pool || [])], changes = [], lk = locked || new Set();
-      if (!out.length) return { pool: out, changes };
-      for (let i = 0; i < Math.min(added.length, removed.length); i++) {
-        const a = added[i], b = removed[i];
-        const at = out.indexOf(a.id);
-        if (at < 0 || lk.has(a.id) || lk.has(b.id) || out.includes(b.id)) continue;
-        if (!(b.skill_kind === 'attack' || b.skill_kind === 'heal') || b.is_equippable === 0 || b.is_equippable === false) continue;
-        out[at] = b.id; changes.push({ from: a, to: b });
-      }
-      return { pool: out, changes };
-    }
-    // Như trên nhưng tự tìm chiêu thêm / bớt bằng cách so 2 bộ chiêu đang trang bị (dùng khi bạn đổi chiêu ngoài tool)
-    static rotateByDiff(prevEq, newEq, pool, locked) {
-      const pid = new Set((prevEq || []).map(x => x.id)), nid = new Set((newEq || []).map(x => x.id));
-      return SkillCatalog.rotatePool((newEq || []).filter(x => !pid.has(x.id)), (prevEq || []).filter(x => !nid.has(x.id)), pool, locked);
     }
     // "Kim Quang Trảm (Kim · Công kích · 15 MP · ×1.49)"
     static label(x) {
@@ -757,12 +755,12 @@
   //  um       = đang ở trong phiên U Minh Cốc (săn yêu / tầm bảo không mở trận mới)
   //  umBattle = U Minh Cốc đang giữa một trận (boss chờ trận đó xong rồi mới đánh)
   class Coordinator {
-    constructor() { this.boss = false; this.bossPending = false; this.farm = false; this.hunt = false; this.bt = false; this.btPause = false; this.btPauseSince = 0; this.btWake = false; this.um = false; this.umBattle = false; this.bossOn = false; this.tower = false; this.towerBattle = false; this.skillGate = null; }
+    constructor() { this.boss = false; this.bossPending = false; this.farm = false; this.hunt = false; this.bt = false; this.btPause = false; this.btPauseSince = 0; this.btWake = false; this.um = false; this.umBattle = false; this.bossOn = false; this.tower = false; this.towerBattle = false; this.pvpBattle = false; this.skillGate = null; }
     //  skillGate = hàm do App gắn: có lệnh đổi chiêu đang chờ và không còn trận nào dở thì đổi ngay (trả promise để chế độ gọi đợi), không có việc thì trả null
     //  bossPending = đang bật chế độ boss VÀ còn boss để đánh: U Minh Cốc không vào / không mở lượt mới (trong U Minh HP, MP không tự hồi theo thời gian; chỉ hồi được bằng đan)
-    //  tower = leo tháp đang bật (tầm bảo nhường) | towerBattle = leo tháp đang giữa một trận
+    //  tower = leo tháp đang bật (tầm bảo nhường) | towerBattle = leo tháp đang giữa một trận | pvpBattle = đấu pháp đang giữa một trận (không đổi chiêu, đột phá chờ)
     //  btPause = đột phá đang chen vào: mọi chế độ đang đánh dừng trước đòn kế tiếp | btWake = có việc vừa xong (vd. đánh boss), đột phá kiểm tra tu vi ngay
-    get fighting() { return this.boss || this.farm || this.hunt || this.umBattle || this.towerBattle; }
+    get fighting() { return this.boss || this.farm || this.hunt || this.umBattle || this.towerBattle || this.pvpBattle; }
   }
 
   // Cấu hình dự phòng, KHÔNG theo chế độ: chỉ PillManager không có khóa chế độ (nút "Hồi MP ngay") dùng tới. Đan hồi MP của từng chế độ nằm ở MpPillConfig
@@ -771,7 +769,7 @@
   }
   // Cài đặt đan hồi HP theo từng chế độ (boss | farm | hunt | um | tower): bật/tắt + dùng đan khi HP < low, dùng tới khi HP >= target (0.05 … 0.95)
   // các chế độ có đan hồi HP / MP, chiêu hồi máu riêng
-  const MODES5 = ['boss', 'hunt', 'farm', 'um', 'tower'];
+  const MODES5 = ['boss', 'hunt', 'farm', 'um', 'tower', 'pvp'];
   class HpPillConfig {
     constructor() {
       this.modes = {};
@@ -832,7 +830,7 @@
     }
   }
   // Ngưỡng MP theo từng chế độ (farm | hunt | tower | um): MP% <= pause thì tạm dừng (không mở trận mới; U Minh: không vào), MP% > resume thì chạy tiếp. enabled = ô bật / tắt (mặc định bật)
-  const GATE_MODES = ['farm', 'hunt', 'tower', 'um'];
+  const GATE_MODES = ['farm', 'hunt', 'tower', 'um', 'pvp'];
   // Các cặp (ô tích + thanh trượt đôi) theo chế độ trên bảng: p = tiền tố id (#ab-<p>-<chế độ>), ev = tên sự kiện phát ra ('<ev>:toggle', '<ev>:range'), lo / hi = mặc định (%)
   const DUAL_SPECS = [
     { p: 'hp', ev: 'hp', modes: MODES5, lo: Math.round(CFG.HP_PILL_TRIGGER_PCT * 100), hi: Math.round(CFG.HP_PILL_DEFAULT_TARGET * 100), checked: false },
@@ -1106,7 +1104,8 @@
       super();
       this.api = deps.api; this.sleep = deps.sleep || (() => Promise.resolve());
       this.enabled = true; this.busy = false; this.realm = null;
-      this.pool = new Set(); this.locked = new Set(); // id (inventory) chiêu được phép gắn / chiêu bị khóa
+      this.recent = new Set(); // id chiêu công kích vừa gắn ở lần đổi chiêu gần nhất (lần sau ưu tiên tháo chiêu khác)
+      this.pool = SkillCatalog.normPool(); this.locked = new Set(); // ô chiêu dự bị cố định (mỗi hệ 1 chiêu công kích + 1 hồi máu) / chiêu bị khóa
     }
     log(m) { this.emit('log', m); }
     // Trả về true nếu đã đổi chiêu. Lỗi thì ghi log, không ném.
@@ -1118,10 +1117,12 @@
         const inv = book.skills; this.slots = book.slots;
         if (me && typeof me.realm_id === 'number') this.realm = me.realm_id; // cảnh giới có thể vừa đột phá: đọc lại mỗi lần
         const realm = this.realm;
-        const plan = SkillCatalog.plan(inv, el, realm, { pool: this.pool, locked: this.locked, slots: book.slots });
-        if (plan.reason === 'nopool') { this.log(`Bộ chiêu đang mang không có chiêu công kích khắc ${el} nhưng chưa chọn chiêu dự bị ("Chiêu dùng để thay") nên không đổi (${who}), giữ nguyên bộ chiêu.`); return false; }
-        if (plan.reason === 'none') { this.log(`Bộ chiêu đang mang không có chiêu công kích khắc ${el} và chiêu dự bị cũng không có chiêu khắc nào dùng được (${who}), giữ nguyên bộ chiêu.`); return false; }
-        if (plan.reason === 'locked') { this.log(`Có chiêu dự bị khắc ${el} nhưng không có chiêu nào tháo được (bị khóa 🔒 hoặc là chiêu hồi máu duy nhất) (${who}), giữ nguyên bộ chiêu.`); return false; }
+        const plan = SkillCatalog.plan(inv, el, realm, { pool: this.pool, locked: this.locked, recent: this.recent, slots: book.slots });
+        if (plan.healReason === 'none') this.log(`Ô dự bị hồi máu không dùng được (chiêu không còn, chưa đủ cảnh giới hoặc không phải chiêu hồi máu), bỏ qua (${who}).`);
+        if (plan.healReason === 'locked') this.log(`Có chiêu hồi máu dự bị nhưng không có chiêu nào tháo được (bị khóa 🔒), không gắn hồi máu (${who}).`);
+        if (plan.reason === 'nopool') this.log(`Bộ chiêu đang mang không có chiêu công kích khắc ${el} và ô dự bị hệ ${Object.keys(KHAC).find(k => KHAC[k] === el)} đang trống, giữ nguyên bộ chiêu (${who}).`);
+        if (plan.reason === 'none') this.log(`Bộ chiêu đang mang không có chiêu công kích khắc ${el} và chiêu ở ô dự bị hệ ${Object.keys(KHAC).find(k => KHAC[k] === el)} không dùng được (không còn, chưa đủ cảnh giới hoặc không phải chiêu công kích), giữ nguyên bộ chiêu (${who}).`);
+        if (plan.reason === 'locked') this.log(`Có chiêu dự bị khắc ${el} nhưng không có chiêu nào tháo được (bị khóa 🔒), giữ nguyên bộ chiêu (${who}).`);
         if (!plan.actions.length) return false;
         const nm = x => `"${x.name}" (${x.skill_element}${x.skill_kind === 'attack' ? ' ×' + Number(x.skill_damage_multiplier) : ', hồi máu'})`;
         this.log(`Đổi chiêu khắc ${el} cho ${who}: ${plan.actions.map(a => `${a.op === 'equip' ? 'gắn' : 'tháo'} ${a.op === 'equip' ? nm(a.item) : `"${a.item.name}"`}`).join(', ')}.`);
@@ -1132,8 +1133,7 @@
           if (d && Array.isArray(d.skills)) { cur = d.skills; this.slots = d.slots; }
           await this.sleep(CFG.SWAP_CALL_GAP_MS);
         }
-        const rot = SkillCatalog.rotatePool(plan.actions.filter(a => a.op === 'equip').map(a => a.item), plan.actions.filter(a => a.op === 'unequip').map(a => a.item), [...this.pool], this.locked);
-        if (rot.changes.length) { this.pool = new Set(rot.pool); this.emit('pool', rot); }
+        this.recent = new Set(plan.add.filter(x => x.skill_kind === 'attack').map(x => x.id));
         this.emit('change', cur, this.slots);
         return true;
       } catch (e) {
@@ -1162,8 +1162,6 @@
           if (d && Array.isArray(d.skills)) { cur = d.skills; this.slots = d.slots; }
           await this.sleep(CFG.SWAP_CALL_GAP_MS);
         }
-        const rot = SkillCatalog.rotatePool(plan.actions.filter(a => a.op === 'equip').map(a => a.item), plan.actions.filter(a => a.op === 'unequip').map(a => a.item), [...this.pool], this.locked);
-        if (rot.changes.length) { this.pool = new Set(rot.pool); this.emit('pool', rot); }
         this.emit('change', cur, this.slots);
         return 'changed';
       } catch (e) {
@@ -1193,6 +1191,23 @@
     stop() { this.st.running = false; }
     releaseFlags() {}
     async swapSkills(el, who) { return this.swapper ? this.swapper.ensureFor(el, who) : false; }
+    // Đổi chiêu khắc hệ trước khi mở trận săn yêu / tầm bảo. fetchEl: async () => hệ của mục tiêu (null = chưa biết).
+    // Tắt tự đổi chiêu: không làm gì. Không lấy được hệ: tải lại tối đa PREMATCH_RETRIES lần; quá số lần thì tạm dừng PREMATCH_PAUSE_MS rồi trả 'paused' (làm lại từ đầu).
+    // Trả 'ok' (đã xử lý, kể cả không đổi được chiêu: vẫn đánh) | 'paused' | 'stop' (chế độ bị tắt trong lúc chờ).
+    async swapBeforeMatch(alive, fetchEl, who) {
+      if (!this.swapper || !this.swapper.enabled) return 'ok';
+      for (let i = 1; i <= CFG.PREMATCH_RETRIES; i++) {
+        let el = null, err = '';
+        try { el = await fetchEl(); } catch (e) { err = e.message; }
+        if (!alive()) return 'stop';
+        if (el) { await this.swapSkills(el, who); return alive() ? 'ok' : 'stop'; }
+        this.log(`Chưa lấy được hệ của mục tiêu ${who}${err ? ` (${err})` : ''} (lần ${i}/${CFG.PREMATCH_RETRIES}).`);
+        if (i < CFG.PREMATCH_RETRIES) { await sleepSlices(this.sleep, CFG.PREMATCH_RETRY_MS, alive); if (!alive()) return 'stop'; }
+      }
+      this.log(`Không lấy được hệ của mục tiêu ${who} sau ${CFG.PREMATCH_RETRIES} lần: tạm dừng ${CFG.PREMATCH_PAUSE_MS / 60000} phút rồi bắt đầu lại từ đầu.`);
+      await sleepSlices(this.sleep, CFG.PREMATCH_PAUSE_MS, alive);
+      return alive() ? 'paused' : 'stop';
+    }
     async execute(/* alive */) { throw new Error('execute() chưa được cài đặt'); }
 
     // gắn 1 dịch vụ con (Healer, PillManager...) để log của nó đi qua engine này
@@ -1492,7 +1507,7 @@
     async sYield(c) {
       if (!c.alive()) return 'EXIT';
       // nhường trận săn yêu / tầm bảo / U Minh dở; trong 3 phút đầu giờ còn nhường cho đột phá (ưu tiên cao nhất)
-      while ((this.coord.farm || this.coord.hunt || this.coord.umBattle || this.coord.towerBattle || (this.coord.bt && inBossWindow(this.now()))) && c.alive()) await this.sleep(500);
+      while ((this.coord.farm || this.coord.hunt || this.coord.umBattle || this.coord.towerBattle || this.coord.pvpBattle || (this.coord.bt && inBossWindow(this.now()))) && c.alive()) await this.sleep(500);
       if (!c.alive()) return 'EXIT';
       if (!this.isEnabled(c.boss)) return this.skipDisabled(c.boss);
       if (!c.swapDone) { c.swapDone = true; await this.swapSkills(c.boss.element, `boss ${SIZE_NAME[c.boss.size]} #${c.boss.id}`); if (!c.alive()) return 'EXIT'; } // đổi sang chiêu khắc trước đòn đầu
@@ -1835,7 +1850,7 @@
       let failed = false;
       try {
         const t0 = this.now();
-        const busy = () => (this.bossWindow ? coord.farm || coord.hunt || coord.umBattle || coord.towerBattle : coord.fighting);
+        const busy = () => (this.bossWindow ? coord.farm || coord.hunt || coord.umBattle || coord.towerBattle || coord.pvpBattle : coord.fighting);
         if (coord.fighting) await this.sleep(CFG.BT_SETTLE_MS); // đòn đang gửi dở xong rồi mới đột phá
         if (!c.alive()) return null;
         if (c.pv && typeof c.pv.chance === 'number') {
@@ -2024,7 +2039,7 @@
    *  BeastCatalog (domain): nhận diện trứng, bộ lọc độ hiếm / sao, quy tắc bảo vệ
    *  BeastEngine FSM (chế độ tự động): LOAD → RELEASE → HATCH → (LOAD | WAIT) → LOAD ...
    *   - LOAD    : đọc danh sách thú + túi đồ (đếm trứng, số thú)
-   *   - RELEASE : phóng sinh các con khớp bộ lọc để có chỗ trống. Chế độ tự động KHÔNG BAO GIỜ phóng sinh Sử thi / Huyền thoại
+   *   - RELEASE : phóng sinh các con khớp bộ lọc để có chỗ trống. Chế độ tự động KHÔNG BAO GIỜ phóng sinh Huyền thoại (Sử thi phóng sinh bình thường theo bộ lọc)
    *   - HATCH   : mở min(số trứng, BEAST_HATCH_MAX, chỗ trống) trứng; còn trứng thì quay LOAD (lại phóng sinh rồi mở tiếp)
    *   - WAIT    : hết trứng / Yêu Thú Các đầy mà không phóng sinh được → chờ BEAST_POLL_MS; đổi bộ lọc là kiểm tra ngay
    *  Nút tay (manualHatch / manualRelease) dùng chung khóa tuần tự với vòng tự động để không gọi API chồng nhau.
@@ -2049,12 +2064,13 @@
       return '';
     }
     static releasable(beasts, filter, allowHigh) {
-      return (beasts || []).filter(b => filter.rar[b.rarity] === true && (allowHigh || !BeastCatalog.HIGH.includes(b.rarity)) && !BeastCatalog.protectedReason(b, filter));
+      return (beasts || []).filter(b => filter.rar[b.rarity] === true && (allowHigh || !BeastCatalog.AUTO_BLOCK.includes(b.rarity)) && !BeastCatalog.protectedReason(b, filter));
     }
     static label(b) { return `${b.name} (${BeastCatalog.LABEL[b.rarity] || b.rarity} · ${b.starRating}★ · Lv${b.level})`; }
   }
   BeastCatalog.KEYS = ['thuong', 'hiem', 'su_thi', 'huyen_thoai'];
-  BeastCatalog.HIGH = ['su_thi', 'huyen_thoai'];
+  BeastCatalog.HIGH = ['su_thi', 'huyen_thoai']; // nút tay: hỏi xác nhận khi có loại này
+  BeastCatalog.AUTO_BLOCK = ['huyen_thoai']; // chế độ tự động: không bao giờ phóng sinh
   BeastCatalog.LABEL = { thuong: 'Thường', hiem: 'Hiếm', su_thi: 'Sử thi', huyen_thoai: 'Huyền thoại' };
 
   class BeastEngine extends Engine {
@@ -2082,17 +2098,29 @@
       this.emit('info', { eggs: BeastCatalog.eggCount(inv), count: b.length });
       return { beasts: b, inv: Array.isArray(inv) ? inv : [] };
     }
-    // Phóng sinh từng con: xem trước để kiểm tra lại (không xuất chiến / Lv1 / đúng độ hiếm) rồi mới xóa. Trả mảng id đã phóng sinh.
+    // Phóng sinh hàng loạt (mỗi lô tối đa BEAST_RELEASE_BULK_MAX con = sức chứa Yêu Thú Các). Mỗi lô: đọc lại danh sách thú để kiểm tra trạng thái mới nhất
+    // (không xuất chiến / Lv1 / đúng độ hiếm; xem trước hàng loạt chỉ trả số lượng) → xem trước lô → phóng sinh lô. Số lượng xem trước lệch số id gửi thì bỏ lô, không xóa.
+    // Trả mảng id đã phóng sinh.
     async releaseList(list, alive) {
       const done = [];
-      for (const b of list) {
+      for (let i = 0; i < list.length; i += CFG.BEAST_RELEASE_BULK_MAX) {
         if (alive && !alive()) break;
-        const pv = await this.api.beastReleasePreview(b.id);
-        if (!pv || pv.isActive !== false || Number(pv.level) !== 1 || pv.rarity !== b.rarity) { this.log(`Bỏ qua ${BeastCatalog.label(b)}: trạng thái đã đổi (xuất chiến / lên cấp / khác độ hiếm).`); continue; }
-        const d = await this.api.releaseBeast(b.id);
-        done.push(b.id);
-        this.log(`Đã phóng sinh ${BeastCatalog.label(b)}${d && d.refundQty ? `, nhận ${d.refundQty} ${d.refundItemName || ''}` : ''}.`);
-        await this.sleep(CFG.BEAST_CALL_GAP_MS);
+        const chunk = list.slice(i, i + CFG.BEAST_RELEASE_BULK_MAX);
+        const fresh = new Map(((await this.api.getBeasts()) || []).map(b => [b.id, b]));
+        const okList = [];
+        for (const b of chunk) {
+          const f = fresh.get(b.id);
+          if (!f || f.isActive !== false || Number(f.level) !== 1 || f.rarity !== b.rarity) this.log(`Bỏ qua ${BeastCatalog.label(b)}: trạng thái đã đổi (xuất chiến / lên cấp / khác độ hiếm / không còn).`);
+          else okList.push(b);
+        }
+        if (!okList.length) continue;
+        const ids = okList.map(b => b.id);
+        const pv = await this.api.beastReleaseBulkPreview(ids);
+        if (!pv || Number(pv.count) !== ids.length) { this.log(`Bỏ lô ${ids.length} con: xem trước báo ${pv ? pv.count : '?'} con, không khớp.`); continue; }
+        const d = await this.api.beastReleaseBulk(ids);
+        done.push(...ids);
+        this.log(`Đã phóng sinh ${ids.length} con (${okList.map(BeastCatalog.label).join(', ')})${d && d.refundQty ? `, nhận ${d.refundQty} ${d.refundItemName || ''}` : ''}.`);
+        if (i + CFG.BEAST_RELEASE_BULK_MAX < list.length) await this.sleep(CFG.BEAST_CALL_GAP_MS);
       }
       return done;
     }
@@ -2138,7 +2166,7 @@
       }
     }
     async sRelease(c) {
-      const list = BeastCatalog.releasable(c.beasts, this.st.filter, false); // tự động: không bao giờ đụng Sử thi / Huyền thoại
+      const list = BeastCatalog.releasable(c.beasts, this.st.filter, false); // tự động: không bao giờ đụng Huyền thoại
       if (!list.length) return 'HATCH';
       await this.yieldToBossFight(c.alive, 'yêu thú');
       if (!c.alive()) return null;
@@ -2223,6 +2251,7 @@
       if (me && typeof me.hp === 'number') st.hp = me.hp;
       if (me && me.hp_max > 0) st.hpMax = me.hp_max;
       if (me && typeof me.realm_id === 'number') st.realm = me.realm_id;
+      if (me && typeof me.realm_level === 'number') st.realmLevel = me.realm_level;
     }
     hpPct() { const { hp, hpMax } = this.st; return typeof hp === 'number' && hpMax > 0 ? hp / hpMax : null; }
     hpText() { const { hp, hpMax } = this.st; const p = this.hpPct(); return p == null ? `${hp}` : `${hp}/${hpMax} = ${Math.round(p * 100)}%`; }
@@ -2472,14 +2501,19 @@
       if (d.result === 'win') {
         st.kills++;
         const r = d.rewards || {};
-        const items = (r.itemsDropped || []).map(i => `${i.name} x${i.quantity}`).join(', ');
-        this.log(`${label} → THẮNG #${st.kills}: +${r.expGained ?? 0} tu vi, +${r.lockedSpiritStonesGained ?? 0} linh thạch khóa${items ? ', nhặt: ' + items : ''}`);
+        this.log(this.winLine(label, d));
         if (r.bagFull) await this.noteBagFull();
         return this.finish(c, 'win');
       }
       return this.onNonWin(c, d);
     }
 
+    // Dòng log khi thắng (phần thưởng khác nhau theo chế độ; đấu pháp ghi đè: chỉ có điểm Elo)
+    winLine(label, d) {
+      const r = d.rewards || {};
+      const items = (r.itemsDropped || []).map(i => `${i.name} x${i.quantity}`).join(', ');
+      return `${label} → THẮNG #${this.st.kills}: +${r.expGained ?? 0} tu vi, +${r.lockedSpiritStonesGained ?? 0} linh thạch khóa${items ? ', nhặt: ' + items : ''}`;
+    }
     // Trận kết thúc không phải thắng. Mặc định (tầm bảo / săn yêu): dừng để bạn kiểm tra. Lớp con có thể ghi đè.
     onNonWin(c, d) {
       this.log(`Trận kết thúc với kết quả "${d.result}", tự dừng để bạn kiểm tra.`);
@@ -2553,7 +2587,20 @@
       const p = this.pct();
       if (this.lowKinds().length) return 'MP_WAIT';
       if (st.tickets === 0) return 'TICKET_WAIT'; // hết vé tầm bảo: chờ tới đầu giờ sau
+      const sw = await this.swapBeforeMatch(c.alive, () => this.zoneElement(), `tầm bảo (bí cảnh ${st.zone})`); // đổi chiêu theo hệ con lớn nhất của bí cảnh, trước khi explore
+      if (sw === 'stop') return null;
+      if (sw === 'paused') { st.zoneEl = {}; return 'DISPATCH'; }
       return 'EXPLORE';
+    }
+
+    // Hệ của con lớn nhất (monsterId lớn nhất, thường là boss) trong bí cảnh đang chọn. Trận tầm bảo gán quái ngẫu nhiên theo tier nên chỉ biết hệ sau khi mở trận; lấy hệ con lớn nhất từ danh sách để đổi chiêu trước. Có nhớ lại theo bí cảnh.
+    async zoneElement() {
+      const { st } = this; st.zoneEl = st.zoneEl || {};
+      if (st.zoneEl[st.zone]) return st.zoneEl[st.zone];
+      const d = await this.api.getZoneMonsters(st.zone), list = (d && d.monsters) || [];
+      const top = list.filter(m => m && m.element).sort((a, b) => b.monsterId - a.monsterId)[0];
+      if (top) st.zoneEl[st.zone] = top.element;
+      return top ? top.element : null;
     }
 
     // Hết vé tầm bảo: không mở trận mới, chờ tới đầu giờ kế tiếp rồi thử lại (chưa có vé thì chờ giờ sau nữa)
@@ -2751,7 +2798,19 @@
       if (tk && typeof tk.tickets === 'number') this.setTickets(tk.tickets);
       if (tk && tk.tickets <= 0) { coord.hunt = false; c.tk = tk; return 'WAIT_TICKETS'; } // nhả cờ trong lúc chờ vé để tầm bảo chạy
       c.tkState.logged = false;
+      const sw = await this.swapBeforeMatch(c.alive, () => this.huntElement(), `săn yêu (quái #${st.monsterId})`); // đổi chiêu theo hệ quái đã chọn, trước khi vào trận
+      if (sw === 'stop') { coord.hunt = false; return null; }
+      if (sw === 'paused') { coord.hunt = false; st.monEl = {}; return 'DISPATCH'; }
       return 'START';
+    }
+
+    // Hệ của quái săn yêu đang chọn (từ danh sách quái, nhớ lại theo id; không thấy id thì tải lại danh sách ở lần sau)
+    async huntElement() {
+      const { st } = this; st.monEl = st.monEl || {};
+      if (st.monEl[st.monsterId]) return st.monEl[st.monsterId];
+      const list = await this.api.getMonsters();
+      for (const m of list || []) if (m && m.element) st.monEl[m.id] = m.element;
+      return st.monEl[st.monsterId] || null;
     }
 
     async sWaitTickets(c) {
@@ -3253,6 +3312,9 @@
       if (c.deaths >= CFG.UM_MAX_DEATHS) { this.log(`Đã gục ${c.deaths} lần trong phiên này, bỏ qua phần còn lại của phiên.`); return 'END'; }
       while ((coord.farm || coord.hunt || coord.towerBattle) && c.alive() && !this.over()) await this.sleep(500); // đợi trận đang dở xong
       if (!c.alive()) return null;
+      const umEl = CFG.UM_ELEMENT_BY_REALM[this.st.realm]; // đổi sang chiêu khắc hệ quái của cảnh giới này trước khi vào
+      if (umEl) { if ((await this.swapBeforeMatch(c.alive, async () => umEl, `U Minh Cốc (cảnh giới ${this.st.realm}, quái hệ ${umEl})`)) === 'stop') return null; }
+      else if (!c.noElLogged && this.swapper && this.swapper.enabled) { c.noElLogged = true; this.log(`Chưa biết hệ quái U Minh Cốc ở cảnh giới ${this.st.realm}, không đổi chiêu.`); }
       const gate = UMinhPlanner.chooseGate(um.cells, um.grid.size, um.grid.spawns, st.spawn, this.rand, c.lastDeadGate);
       if (!gate) { // không có cổng: không bỏ phiên, nhường chế độ khác rồi đọc lại bản đồ cho tới hết phiên
         coord.um = false;
@@ -3663,16 +3725,43 @@
   class WarCatalog {
     static RING = { outer: 0, middle: 1, center: 2 };
     static ringRank(t) { const r = WarCatalog.RING[t && t.ring]; return r == null ? -1 : r; }
-    // Lãnh địa tông của mình đã đăng ký (được duyệt), giữ thứ tự của server
+    // Đăng ký còn hiệu lực: được duyệt, hoặc chưa có trạng thái, hoặc đang chờ duyệt (trước giờ khóa đăng ký server có thể chưa ghi "admitted"); bị từ chối / hủy / thua thầu thì không
+    static regOk(r) { return !(r && typeof r.status === 'string' && /^(reject|refus|den|cancel|lost|fail|out)/i.test(r.status)); }
+    // Vai trò của tông trên lãnh địa: 'hold' = đang chiếm (ownerSectId) | 'attack' = đã đăng ký chiếm và được duyệt | 'plan' = đã đăng ký, chưa được duyệt | null = không liên quan.
+    // Lãnh địa đang chiếm KHÔNG có đăng ký của tông (server chỉ ghi đăng ký của bên tấn công) nên phải xét ownerSectId.
+    static role(t, sectId) {
+      if (!t || sectId == null) return null;
+      if (t.ownerSectId === sectId) return 'hold';
+      const mine = (t.registrations || []).filter(r => r.sectId === sectId && WarCatalog.regOk(r));
+      if (!mine.length) return null;
+      return mine.some(r => r.status == null || r.status === 'admitted') ? 'attack' : 'plan';
+    }
+    // Tên các tông KHÁC đã đăng ký (được duyệt) chiếm lãnh địa này
+    static rivals(t, sectId) {
+      return ((t && t.registrations) || []).filter(r => r.sectId !== sectId && WarCatalog.regOk(r)).map(r => r.sectName || `#${r.sectId}`);
+    }
+    // Lãnh địa tông của mình đang chiếm hoặc đã đăng ký chiếm (được duyệt), giữ thứ tự của server
     static mine(ov) {
       const id = ov && ov.me && ov.me.sect && ov.me.sect.id;
       if (id == null) return [];
-      return (ov.territories || []).filter(t => (t.registrations || []).some(r => r.sectId === id && (r.status == null || r.status === 'admitted')));
+      return (ov.territories || []).filter(t => WarCatalog.role(t, id));
+    }
+    // Nhãn để phân biệt trong danh sách: "[Đã có]" / "[Sẽ chiếm]" và "⚠ bị X chuẩn bị chiếm" khi lãnh địa đang chiếm có tông khác đăng ký
+    static tag(t, sectId) {
+      const r = WarCatalog.role(t, sectId); if (!r) return '';
+      const riv = r === 'hold' ? WarCatalog.rivals(t, sectId) : [];
+      return `${r === 'hold' ? '[Đã có]' : r === 'plan' ? '[Sẽ chiếm, chờ duyệt]' : '[Sẽ chiếm]'}${riv.length ? ` ⚠ bị ${riv.join(', ')} chuẩn bị chiếm` : ''}`;
     }
     // Mặc định: vòng cao hơn trước (outer < middle < center); bằng nhau thì cái đứng trước trong danh sách của server
-    static pickDefault(list) {
+    static pickDefault(list, sectId, locked) {
+      // lãnh địa CHƯA có (sẽ chiếm) trước lãnh địa đang chiếm; rồi vòng cao hơn. Đăng ký chờ duyệt chỉ được ưu tiên khi đăng ký chưa khóa (sau khóa mà chưa duyệt thì không vào được → xếp cuối)
+      const rank = t => {
+        const r = sectId == null ? null : WarCatalog.role(t, sectId);
+        const base = r === 'attack' ? 2 : r === 'plan' ? (locked ? -1 : 2) : r === 'hold' ? 1 : 0;
+        return base * 10 + WarCatalog.ringRank(t);
+      };
       let best = null;
-      for (const t of list || []) if (!best || WarCatalog.ringRank(t) > WarCatalog.ringRank(best)) best = t;
+      for (const t of list || []) if (!best || rank(t) > rank(best)) best = t;
       return best;
     }
     // Lựa chọn tay hết hạn lúc 20:55 (giờ máy) hôm nay; đã qua 20:55 thì 20:55 ngày mai
@@ -3729,7 +3818,7 @@
       st.scanAt = 0;
       this.emit('choice', st.choice);
       if (code) this.log(`Chọn lãnh địa ${this.terrName(code)}: giữ tới ${new Date(st.choice.until).toLocaleString([], { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}.`);
-      else this.log('Về chế độ tự chọn lãnh địa (vòng cao trước).');
+      else this.log('Về chế độ tự chọn lãnh địa (lãnh địa chưa có trước, rồi vòng cao).');
     }
 
     async fail(e, label, alive) {
@@ -3767,31 +3856,43 @@
       return ov;
     }
 
-    // Quét lãnh địa của tông: khi vừa bật và mỗi giờ lúc xx:25 (hoặc ngay sau khi đổi lựa chọn)
+    // Quét lãnh địa của tông: khi vừa bật, mỗi giờ lúc xx:25, lúc tới giờ tập hợp mỗi ngày, và mỗi phút khi chưa thấy lãnh địa nào (tông có thể chọn / chiếm sau khi bạn bật).
+    // Ghi log lãnh địa đã có, sẽ chiếm, và lãnh địa đang chiếm bị tông khác chuẩn bị chiếm.
     scan(ov) {
       const st = this.st, now = this.now();
       if (now < st.scanAt) return;
-      st.scanAt = WarCatalog.nextScan(now);
       const list = WarCatalog.mine(ov);
+      st.scanAt = list.length ? WarCatalog.nextScan(now) : now + CFG.WAR_NOTERR_SCAN_MS;
       st.options = list;
       if (st.choice && now >= st.choice.until) { st.choice = null; this.emit('choice', null); this.log('Lựa chọn lãnh địa đã hết hạn (20:55), về chế độ tự chọn.'); }
       const mine = st.choice && list.find(t => t.code === st.choice.code);
-      const pick = mine || WarCatalog.pickDefault(list);
+      const pick = mine || WarCatalog.pickDefault(list, st.sectId, !!(ov.day && ov.day.locked));
       const code = pick ? pick.code : null;
-      if (code !== st.territory) this.log(code ? `Lãnh địa chiếm: ${pick.name} (${pick.ringLabel || pick.ring})${mine ? ' [bạn chọn]' : ''}.` : 'Tông chưa đăng ký lãnh địa nào được duyệt.');
+      const sid = st.sectId, names = r => list.filter(t => WarCatalog.role(t, sid) === r).map(t => {
+        const riv = r === 'hold' ? WarCatalog.rivals(t, sid) : [];
+        return riv.length ? `${t.name} (⚠ bị ${riv.join(', ')} chuẩn bị chiếm)` : t.name;
+      }).join(', ') || 'không có';
+      if (!list.length && st.diagKey !== `${ov.day && ov.day.key}:${ov.day && ov.day.phase}`) { // lần quét rỗng đầu tiên của mỗi giai đoạn: ghi cái server đang thấy để dễ tìm lý do
+        st.diagKey = `${ov.day && ov.day.key}:${ov.day && ov.day.phase}`;
+        const regs = {}; let n = 0;
+        for (const t of ov.territories || []) if ((t.registrations || []).length) { n++; for (const r of t.registrations) { const k = `${r.sectId === sid ? 'tông bạn' : 'tông khác'}/${r.status}`; regs[k] = (regs[k] || 0) + 1; } }
+        this.log(`Chưa thấy lãnh địa nào của tông #${sid} (giai đoạn ${ov.day && ov.day.phase}, khóa đăng ký: ${ov.day && ov.day.locked}); server trả ${(ov.territories || []).length} lãnh địa, ${n} có đăng ký ${JSON.stringify(regs)}.`);
+      }
+      if (list.length) this.log(`Quét lãnh địa (mỗi giờ lúc xx:25): đã có: ${names('hold')}; sẽ chiếm: ${[names('attack'), names('plan')].filter(x => x !== 'không có').join(', ') || 'không có'}.`);
+      if (code !== st.territory) this.log(code ? `Lãnh địa đánh hôm nay: ${pick.name} (${pick.ringLabel || pick.ring}) ${WarCatalog.tag(pick, sid)}${mine ? ' [bạn chọn]' : ''}.` : 'Tông chưa có và chưa đăng ký lãnh địa nào được duyệt, quét lại mỗi phút.');
       st.territory = code;
-      this.emit('territories', list, code, !!mine);
+      this.emit('territories', list, code, !!mine, sid);
     }
 
     // Đổi chiêu (một lần mỗi ngày) rồi vào lãnh địa. true = đã vào (hoặc đã ở trong lãnh địa), false = chưa vào được
     async enter(ov, alive) {
       const st = this.st, day = ov.day, g = ov.me.garrison;
       if (g && g.territoryCode) {
-        if (st.territory !== g.territoryCode) { st.territory = g.territoryCode; this.emit('territories', st.options, st.territory, true); }
+        if (st.territory !== g.territoryCode) { st.territory = g.territoryCode; this.emit('territories', st.options, st.territory, true, st.sectId); }
         return true;
       }
       if (!st.territory) {
-        if (st.noTerrDay !== day.key) { st.noTerrDay = day.key; this.log('Tông chưa đăng ký lãnh địa nào được duyệt nên không vào được Tông Chiến hôm nay.'); }
+        if (st.noTerrDay !== day.key) { st.noTerrDay = day.key; this.log('Tông chưa có và chưa đăng ký lãnh địa nào được duyệt nên chưa vào được Tông Chiến, quét lại mỗi phút.'); }
         this.status('Tông chưa đăng ký lãnh địa nào được duyệt'); await sleepSlices(this.sleep, 60000, alive); return false;
       }
       if (this.swapper && st.swapDay !== day.key) {
@@ -3930,6 +4031,7 @@
         if (day.skipped || !day.liveStartAt || !day.liveEndAt || now >= day.liveEndAt) { await this.waitUntil(alive, now + CFG.WAR_IDLE_POLL_MS, day.skipped ? 'Hôm nay không có Tông Chiến' : 'Đã hết giờ Tông Chiến, chờ ngày mai'); continue; }
         if (st.doneDay === day.key) { await this.waitUntil(alive, day.liveEndAt + 1000, `Đã đủ ${st.maxAttacks} lượt hôm nay`); continue; }
         if (now < day.gatherAt) { await this.waitUntil(alive, day.gatherAt, 'Chờ tới giờ vào lãnh địa', Math.max(1000, Math.min(CFG.WAR_IDLE_POLL_MS, st.scanAt - this.now()))); continue; }
+        if (st.scanDay !== day.key) { st.scanDay = day.key; st.scanAt = 0; this.scan(ov); } // tới giờ tập hợp: quét lại một lần cho chắc, rồi mới vào lãnh địa
         if (!(await this.enter(ov, alive))) continue;
         if (this.srvNow() < day.liveStartAt) { await this.waitUntil(alive, day.liveStartAt, 'Chờ bắt đầu Tông Chiến', 30000); continue; }
         await this.fightDay(alive);
@@ -3939,6 +4041,392 @@
   }
 
   /* Nhớ chế độ nào đang được BẬT (theo ý người dùng) để tự chạy lại sau khi tải lại trang / đăng nhập lại */
+  /* ---------------------------------------------------------------------
+   *  LUYỆN THỂ (Kỳ Kinh Bát Mạch): 8 mạch, 108 huyệt, mỗi huyệt tối đa cấp maxLv (5). Server chỉ cho luyện 1 huyệt / lần, có giờ chờ.
+   *  Huyệt đầu mỗi mạch luôn luyện được; huyệt kế tiếp mở khi huyệt liền trước đã có cấp >= 1.
+   *  FSM: LOAD → (TRAIN → WAIT → LOAD). Chọn 1 mạch; mỗi lần luyện huyệt rẻ nhất (theo quotes: đá, rồi tu vi), bằng nhau thì huyệt số nhỏ.
+   *  Mạch đầy thì tự dừng; thiếu đá / tu vi thì thử lại sau 5 phút; đang có lượt luyện thì chờ hết giờ. Chạy ngầm song song với chế độ khác.
+   * --------------------------------------------------------------------- */
+  class MeridianCatalog {
+    static get MAI() {
+      return [['Nhâm', 16, 'HP'], ['Đốc', 16, 'Công'], ['Xung', 14, 'Linh lực'], ['Đới', 10, 'Thủ'], ['Dương Kiều', 12, 'Tốc độ'], ['Âm Kiều', 10, 'Né'], ['Dương Duy', 16, 'Bạo kích'], ['Âm Duy', 14, 'Xuyên giáp']]
+        .map(([name, count, stat], i, a) => ({ id: i, name, count, stat, from: a.slice(0, i).reduce((t, x) => t + x[1], 1) })); // stat: thuộc tính mạch tăng
+    }
+    static lv(state, n) { const p = state && state.pts && state.pts[n]; return p ? Number(p.lv) || 0 : 0; }
+    static maxLv(state) { return Number(state && state.maxLv) || 5; }
+    // Huyệt luyện được ngay của mạch `id`: chưa đủ cấp tối đa và đã mở (huyệt đầu, hoặc huyệt liền trước có cấp >= 1)
+    static candidates(state, id) {
+      const m = MeridianCatalog.MAI[id]; if (!m) return [];
+      const out = [], max = MeridianCatalog.maxLv(state);
+      for (let n = m.from; n < m.from + m.count; n++) {
+        if (MeridianCatalog.lv(state, n) >= max) continue;
+        if (n > m.from && MeridianCatalog.lv(state, n - 1) < 1) continue;
+        const q = state && state.quotes && state.quotes[n];
+        if (q) out.push({ n, q });
+      }
+      return out;
+    }
+    static pick(state, id) {
+      return MeridianCatalog.candidates(state, id).sort((a, b) => (a.q.stones - b.q.stones) || (a.q.exp - b.q.exp) || (a.n - b.n))[0] || null;
+    }
+    static done(state, id) { // mọi huyệt của mạch đã đủ cấp tối đa
+      const m = MeridianCatalog.MAI[id], max = MeridianCatalog.maxLv(state);
+      for (let n = m.from; n < m.from + m.count; n++) if (MeridianCatalog.lv(state, n) < max) return false;
+      return true;
+    }
+    static progress(state, id) {
+      const m = MeridianCatalog.MAI[id]; let opened = 0, full = 0;
+      for (let n = m.from; n < m.from + m.count; n++) { const l = MeridianCatalog.lv(state, n); if (l >= 1) opened++; if (l >= MeridianCatalog.maxLv(state)) full++; }
+      return { opened, full, count: m.count };
+    }
+    static affordable(state, q) {
+      const r = (state && state.resources) || {};
+      return Number(r.stones) >= q.stones && Number(r.exp) >= q.exp;
+    }
+  }
+
+  class MeridianEngine extends Engine {
+    constructor(deps) {
+      super(deps);
+      Object.assign(this.st, { mai: null, trained: 0 });
+      this.machine = this.track(new StateMachine('meridian', {
+        LOAD: c => this.sLoad(c), TRAIN: c => this.sTrain(c), WAIT: c => this.sWait(c),
+      }, MeridianEngine.TRANSITIONS));
+    }
+    get startMessage() { return 'BẮT ĐẦU tự động luyện thể.'; }
+    get stopMessage() { return 'ĐÃ DỪNG tự động luyện thể.'; }
+    execute(alive) { return this.machine.run('LOAD', { alive, state: null, pick: null, waitMs: 0, waitText: '' }); }
+    status(text) { this.emit('status', text); }
+    fail(e, label) {
+      this.st.errors++;
+      this.log(`Lỗi ${label}: ${e.message} (lần ${this.st.errors}, thử lại sau ${this.errWaitSec()}s)`);
+    }
+    static fmt(sec) { sec = Math.max(0, Math.ceil(sec)); const m = Math.floor(sec / 60); return m ? `${m} phút ${sec % 60} giây` : `${sec} giây`; }
+
+    async sLoad(c) {
+      if (!c.alive()) return null;
+      const { st, api } = this;
+      if (st.mai == null || !MeridianCatalog.MAI[st.mai]) { await this.waitConfig(c.alive, 'Chưa chọn mạch để luyện thể'); return 'LOAD'; }
+      try { c.state = await api.meridianState(); st.errors = 0; }
+      catch (e) { this.fail(e, 'đọc luyện thể'); await sleepSlices(this.sleep, this.errWaitMs(), c.alive); return 'LOAD'; }
+      const m = MeridianCatalog.MAI[st.mai], pg = MeridianCatalog.progress(c.state, st.mai);
+      this.emit('info', `${m.name} (tăng ${m.stat}): ${pg.opened}/${pg.count} huyệt đã mở, ${pg.full} huyệt đủ cấp ${MeridianCatalog.maxLv(c.state)} · đá ${Number(c.state.resources && c.state.resources.stones || 0).toLocaleString()} · tu vi ${Number(c.state.resources && c.state.resources.exp || 0).toLocaleString()}`);
+      const tr = c.state.training;
+      if (tr && Number(tr.secondsRemaining) > 0) {
+        c.waitMs = (Number(tr.secondsRemaining) + CFG.MERIDIAN_EXTRA_WAIT_MS / 1000) * 1000;
+        c.waitText = `Đang luyện huyệt #${tr.n}, còn ${MeridianEngine.fmt(tr.secondsRemaining)} → chờ xong rồi luyện tiếp`;
+        return 'WAIT';
+      }
+      if (MeridianCatalog.done(c.state, st.mai)) { this.log(`Mạch ${m.name} đã đủ cấp tối đa ở mọi huyệt, dừng luyện thể.`); this.status(''); st.running = false; return null; }
+      c.pick = MeridianCatalog.pick(c.state, st.mai);
+      if (!c.pick) { // không có huyệt nào luyện được (thiếu báo giá): chờ rồi đọc lại
+        c.waitMs = CFG.MERIDIAN_POOR_POLL_MS; c.waitText = `Mạch ${m.name} chưa có huyệt nào luyện được ngay, kiểm tra lại sau ${CFG.MERIDIAN_POOR_POLL_MS / 60000} phút`;
+        return 'WAIT';
+      }
+      if (!MeridianCatalog.affordable(c.state, c.pick.q)) {
+        const r = c.state.resources || {};
+        c.waitMs = CFG.MERIDIAN_POOR_POLL_MS;
+        c.waitText = `Không đủ để luyện huyệt #${c.pick.n} (cần ${c.pick.q.stones} đá, ${c.pick.q.exp.toLocaleString()} tu vi; có ${Number(r.stones || 0).toLocaleString()} đá, ${Number(r.exp || 0).toLocaleString()} tu vi) → thử lại sau ${CFG.MERIDIAN_POOR_POLL_MS / 60000} phút`;
+        return 'WAIT';
+      }
+      return 'TRAIN';
+    }
+
+    async sTrain(c) {
+      const { st, api } = this, p = c.pick, m = MeridianCatalog.MAI[st.mai];
+      if (!c.alive()) return null;
+      try {
+        const d = await api.meridianTrain(p.n);
+        st.trained++; st.errors = 0; c.state = d || c.state;
+        const tr = d && d.training;
+        this.log(`Luyện thể ${m.name}: huyệt #${p.n} lên cấp ${tr ? tr.toLv : MeridianCatalog.lv(c.state, p.n) + 1} (tốn ${p.q.stones} đá, ${p.q.exp.toLocaleString()} tu vi, ${MeridianEngine.fmt(p.q.seconds)}).`);
+        const sec = tr && Number(tr.secondsRemaining) > 0 ? Number(tr.secondsRemaining) : Number(p.q.seconds) || 60;
+        c.waitMs = (sec + CFG.MERIDIAN_EXTRA_WAIT_MS / 1000) * 1000;
+        c.waitText = `Đang luyện huyệt #${p.n}, còn ${MeridianEngine.fmt(sec)} → chờ xong rồi luyện tiếp`;
+        return 'WAIT';
+      } catch (e) {
+        if (/không đủ|thiếu|not enough/i.test(e.message || '')) {
+          c.waitMs = CFG.MERIDIAN_POOR_POLL_MS; c.waitText = `Server báo thiếu tài nguyên: ${e.message} → thử lại sau ${CFG.MERIDIAN_POOR_POLL_MS / 60000} phút`;
+          return 'WAIT';
+        }
+        this.fail(e, `luyện huyệt #${p.n}`);
+        await sleepSlices(this.sleep, this.errWaitMs(), c.alive);
+        return 'LOAD';
+      }
+    }
+
+    async sWait(c) {
+      const { st } = this, mai = st.mai;
+      this.log(c.waitText + '.'); this.status(c.waitText);
+      await sleepSlices(this.sleep, c.waitMs, () => c.alive() && st.mai === mai); // đổi mạch → đọc lại ngay
+      return 'LOAD';
+    }
+  }
+  MeridianEngine.TRANSITIONS = { LOAD: ['LOAD', 'TRAIN', 'WAIT'], TRAIN: ['WAIT', 'LOAD'], WAIT: ['LOAD'] };
+
+  /* ---------------------------------------------------------------------
+   *  VUỐT VE YÊU THÚ: mỗi lần vuốt tăng độ thân mật (+5%), mỗi con hồi 1 giờ (petRemainingMs trong /api/beasts).
+   *  Chỉ vuốt con đang xuất chiến (isActive) chưa đủ độ thân mật. FSM: LOAD → PET → WAIT → LOAD. Chạy ngầm; chờ đúng thời gian hồi ngắn nhất.
+   * --------------------------------------------------------------------- */
+  class PetCatalog {
+    static ready(b) { return b && b.isActive === true && (Number(b.intimacyPct) || 0) < CFG.PET_MAX_INTIMACY && !(Number(b.petRemainingMs) > 0); }
+    static label(b) { return `${b.name} (thân mật ${Number(b.intimacyPct) || 0}%)`; }
+    // ms chờ tới lần vuốt kế (con xuất chiến, chưa đủ thân mật, đang hồi); null nếu không có con nào
+    static nextWait(list) {
+      const w = (list || []).filter(b => b && b.isActive === true && (Number(b.intimacyPct) || 0) < CFG.PET_MAX_INTIMACY && Number(b.petRemainingMs) > 0).map(b => Number(b.petRemainingMs));
+      return w.length ? Math.min(...w) : null;
+    }
+  }
+
+  class PetEngine extends Engine {
+    constructor(deps) {
+      super(deps);
+      Object.assign(this.st, { petted: 0 });
+      this.machine = this.track(new StateMachine('pet', { LOAD: c => this.sLoad(c), PET: c => this.sPet(c), WAIT: c => this.sWait(c) }, PetEngine.TRANSITIONS));
+    }
+    get startMessage() { return 'BẮT ĐẦU tự động vuốt ve yêu thú.'; }
+    get stopMessage() { return 'ĐÃ DỪNG tự động vuốt ve yêu thú.'; }
+    execute(alive) { return this.machine.run('LOAD', { alive, beasts: [], waitMs: 0, waitText: '' }); }
+    status(text) { this.emit('status', text); }
+    fail(e, label) { this.st.errors++; this.log(`Lỗi ${label}: ${e.message} (lần ${this.st.errors}, thử lại sau ${this.errWaitSec()}s)`); }
+    static fmt(ms) { const sec = Math.max(0, Math.ceil(ms / 1000)), m = Math.floor(sec / 60); return m ? `${m} phút ${sec % 60} giây` : `${sec} giây`; }
+
+    async sLoad(c) {
+      if (!c.alive()) return null;
+      try { c.beasts = (await this.api.getBeasts()) || []; this.st.errors = 0; }
+      catch (e) { this.fail(e, 'đọc yêu thú'); await sleepSlices(this.sleep, this.errWaitMs(), c.alive); return 'LOAD'; }
+      c.todo = c.beasts.filter(PetCatalog.ready);
+      if (c.todo.length) return 'PET';
+      const w = PetCatalog.nextWait(c.beasts);
+      if (w != null) { c.waitMs = w + CFG.PET_EXTRA_WAIT_MS; c.waitText = `Chờ ${PetEngine.fmt(c.waitMs)} tới lần vuốt ve kế`; }
+      else {
+        const active = c.beasts.filter(b => b.isActive === true);
+        c.waitMs = CFG.PET_IDLE_POLL_MS;
+        c.waitText = active.length ? `Mọi con xuất chiến đã đủ thân mật ${CFG.PET_MAX_INTIMACY}%, kiểm tra lại sau ${CFG.PET_IDLE_POLL_MS / 60000} phút` : `Không có con nào đang xuất chiến, kiểm tra lại sau ${CFG.PET_IDLE_POLL_MS / 60000} phút`;
+      }
+      return 'WAIT';
+    }
+
+    async sPet(c) {
+      const { st, api } = this;
+      for (const b of c.todo) {
+        if (!c.alive()) return null;
+        try {
+          const d = await api.petBeast(b.id); st.errors = 0; st.petted++;
+          this.log(`Vuốt ve ${b.name}: thân mật ${Number(b.intimacyPct) || 0}% → ${d && d.intimacyPct != null ? d.intimacyPct : '?'}%.`);
+        } catch (e) { this.fail(e, `vuốt ve ${b.name}`); await sleepSlices(this.sleep, this.errWaitMs(), c.alive); return 'LOAD'; }
+        await sleepSlices(this.sleep, CFG.PET_CALL_GAP_MS, c.alive);
+      }
+      return 'LOAD'; // đọc lại để biết thời gian hồi mới
+    }
+
+    async sWait(c) {
+      this.log(c.waitText + '.'); this.status(c.waitText);
+      await sleepSlices(this.sleep, c.waitMs, c.alive);
+      return 'LOAD';
+    }
+  }
+  PetEngine.TRANSITIONS = { LOAD: ['LOAD', 'PET', 'WAIT'], PET: ['LOAD'], WAIT: ['LOAD'] };
+
+  /* ---------------------------------------------------------------------
+   *  ĐẤU PHÁP (PvP, chế độ "challenge": có tính điểm Elo, không phạt karma; KHÔNG dùng chế độ "massacre")
+   *  Ưu tiên thấp nhất: nhường boss, đột phá, U Minh Cốc, săn yêu, leo tháp và trận tầm bảo đang dở. Đánh đủ số trận đã đặt rồi tự tắt.
+   *  Không đổi chiêu (chiêu bị khóa trong lúc đấu pháp, hệ đối thủ chỉ biết sau khi thách đấu): dùng bộ chiêu đang trang bị, chọn chiêu theo hệ đối thủ.
+   *  FSM: INIT → DISPATCH → (YIELD | MP_WAIT | PICK → START → BATTLE) → DISPATCH ...
+   * --------------------------------------------------------------------- */
+  class PvpCatalog {
+    // cấp (level) của mình = (cảnh giới - 1) * 9 + cấp trong cảnh giới (vd. Luyện Hư 6 cấp 6 → 51, khớp với "level" game báo trong trận)
+    static level(realm, realmLevel) { return typeof realm === 'number' && typeof realmLevel === 'number' ? (realm - 1) * CFG.PVP_LEVELS_PER_REALM + realmLevel : null; }
+    // chọn đối thủ: cấp <= cấp mình - gap; điểm cao nhất (điểm Elo nhận được thường cao hơn), bằng điểm thì cấp thấp hơn. Không có thì null.
+    static pick(list, myLevel, gap) {
+      if (!Array.isArray(list) || typeof myLevel !== 'number') return null;
+      const ok = list.filter(o => o && o.id != null && typeof o.level === 'number' && o.level <= myLevel - gap);
+      if (!ok.length) return null;
+      ok.sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0) || a.level - b.level);
+      return ok[0];
+    }
+    // số giây còn phải chờ từ lỗi "Giữa 2 lần thách đấu phải cách nhau 15 giây, hãy chờ N giây nữa"; không phải lỗi này thì null
+    static cooldownSec(e) {
+      if (!e) return null;
+      const m = /chờ (\d+) giây/i.exec(e.message || '');
+      if (e.code === 'PVP_COOLDOWN' || /giữa 2 lần thách đấu/i.test(e.message || '')) return m ? Number(m[1]) : 15;
+      return null;
+    }
+    // đưa trận đấu pháp (đối thủ ở "opponent") về dạng trận quái mà MatchEngine hiểu ("monster", "monster_hp")
+    static norm(m) {
+      if (!m || !m.opponent) return m;
+      const o = m.opponent;
+      return { ...m, monster: { name: o.name, element: o.element, hp_max: o.hp_max, level: o.level }, monster_hp: m.opponent_hp };
+    }
+  }
+
+  class PvpEngine extends MatchEngine {
+    constructor(deps) {
+      super(deps);
+      Object.assign(this.st, { target: CFG.PVP_DEFAULT_COUNT, levelGap: CFG.PVP_DEFAULT_LEVEL_GAP, done: 0, kills: 0, draws: 0, losses: 0, lossTotal: 0, score: null, nextAt: 0, myLevel: null, realmLevel: null });
+      this.onNoBattle = true; // lỗi "không có trận đấu nào" → coi như trận đã kết thúc, vòng ngoài mở trận mới
+      this.machine = this.track(new StateMachine('pvp', {
+        INIT: c => this.sInit(c), DISPATCH: c => this.sDispatch(c), YIELD: c => this.sYield(c), MP_WAIT: c => this.sMpWait(c),
+        PICK: c => this.sPick(c), START: c => this.sStart(c), BATTLE: c => this.sBattle(c),
+      }, PvpEngine.TRANSITIONS));
+    }
+    get hpKey() { return 'pvp'; }
+    get modeName() { return 'đấu pháp'; }
+    get startMessage() { return 'BẮT ĐẦU đấu pháp (challenge, tính Elo).'; }
+    get stopMessage() { return 'ĐÃ DỪNG đấu pháp.'; }
+    status(text) { this.emit('status', text); }
+    releaseFlags() { this.coord.pvpBattle = false; }
+    async refreshSkills() { /* không đổi chiêu trong đấu pháp: giữ bộ chiêu lúc bắt đầu trận */ }
+    async doAction(body) {
+      const r = await this.api.pvpAction(body);
+      if (r && r.data && r.data.match) r.data = { ...r.data, match: PvpCatalog.norm(r.data.match) };
+      return r;
+    }
+    execute(alive) {
+      Object.assign(this.st, { done: 0, kills: 0, draws: 0, losses: 0, lossTotal: 0, nextAt: 0 });
+      return this.machine.run('INIT', { alive, yieldLogged: false, noOppLogged: false });
+    }
+    async fetchCurrent() { const m = await this.api.pvpMatch(); return m && m.player && m.opponent ? PvpCatalog.norm(m) : null; }
+    winLine(label, d) { return `${label} → THẮNG #${this.st.kills}: ${d.scoreDelta != null ? (d.scoreDelta >= 0 ? '+' : '') + d.scoreDelta : '?'} điểm Elo`; }
+    onNonWin(c, d) {
+      const st = this.st, delta = d.scoreDelta != null ? ` (${d.scoreDelta >= 0 ? '+' : ''}${d.scoreDelta} điểm Elo)` : '';
+      if (d.result === 'lose') { st.losses++; st.lossTotal++; this.log(`THUA${delta}: thua liên tiếp ${st.losses}/${CFG.PVP_LOSS_STREAK}.`); return this.finish(c, 'lose'); }
+      st.draws++; this.log(`Trận kết thúc "${d.result}"${delta}.`);
+      return this.finish(c, 'draw');
+    }
+    summary() {
+      const st = this.st;
+      return `Đã đánh ${st.done}/${st.target} · thắng ${st.kills} · thua ${st.lossTotal}${st.draws ? ` · hòa ${st.draws}` : ''}${st.score != null ? ` · ${st.score} điểm` : ''}`;
+    }
+    myLevel() { return this.st.myLevel != null ? this.st.myLevel : PvpCatalog.level(this.st.realm, this.st.realmLevel); }
+
+    async readStats() {
+      try { const s = await this.api.pvpStats(); if (s && typeof s.score === 'number') this.st.score = s.score; return s; } catch (_) { return null; }
+    }
+
+    // đánh một trận (cờ pvpBattle chỉ bật trong lúc đánh), cập nhật số trận / thua liên tiếp
+    async fight(match, alive) {
+      const { st } = this;
+      if (match && match.player && typeof match.player.level === 'number') st.myLevel = match.player.level; // cấp thật do game báo
+      this.coord.pvpBattle = true;
+      let r;
+      try { r = await this.fightMatch(match, alive); } finally { this.coord.pvpBattle = false; }
+      if (r === 'win' || r === 'lose' || r === 'draw') {
+        st.done++;
+        if (r !== 'lose') st.losses = 0;
+        await this.readStats();
+        this.log(`Điểm Elo hiện tại: ${st.score ?? '?'}.`);
+      }
+      this.status(this.summary());
+      if (st.running && st.done >= st.target) { this.log(`Đã đánh đủ ${st.target} trận, tự tắt đấu pháp. ${this.summary()}.`); st.running = false; }
+      return r;
+    }
+
+    async sInit(c) {
+      try {
+        if (this.api.getMe) { try { await this.refreshMe(); } catch (_) {} }
+        const s = await this.readStats();
+        if (s) this.log(`Điểm Elo ${s.score} · thắng ${s.wins} · thua ${s.losses}${s.draws ? ` · hòa ${s.draws}` : ''}.`);
+        const cur = await this.fetchCurrent();
+        if (cur) { this.log('Tiếp tục trận đấu pháp đang dở...'); await this.fight(cur, c.alive); }
+      } catch (e) { this.log(`Không đọc được trạng thái đấu pháp: ${e.message}`); }
+      this.status(this.summary());
+      return 'DISPATCH';
+    }
+
+    async sDispatch(c) {
+      const { coord, st } = this;
+      if (!c.alive() || !st.running) return null;
+      await this.skillGate();
+      if (coord.bt) { await this.sleep(500); return 'DISPATCH'; }
+      if (this.bossWindow) {
+        if (!c.winLogged) { this.log('3 phút đầu giờ dành cho boss: đấu pháp tạm không thách đấu...'); c.winLogged = true; }
+        await this.sleep(1000); return 'DISPATCH';
+      }
+      c.winLogged = false;
+      if (coord.boss || coord.hunt || coord.um || coord.tower) return 'YIELD'; // ưu tiên thấp nhất
+      if (coord.farm || coord.towerBattle) { await this.sleep(500); return 'DISPATCH'; }
+      c.yieldLogged = false;
+      if (this.lowKinds().length) return 'MP_WAIT';
+      return 'PICK';
+    }
+
+    async sYield(c) {
+      if (!c.yieldLogged) { const co = this.coord; this.log(`Đang ${co.boss ? 'đánh boss' : co.um ? 'đi U Minh Cốc' : co.hunt ? 'săn yêu' : 'leo tháp'}, đấu pháp tạm nhường...`); c.yieldLogged = true; }
+      await this.sleep(1000);
+      return 'DISPATCH';
+    }
+
+    async sMpWait(c) {
+      if (!(await this.waitGate(c.alive))) return null;
+      return 'DISPATCH';
+    }
+
+    // chờ hết thời gian hồi 15s, đọc cấp + HP, tải danh sách đối thủ và chọn người
+    async sPick(c) {
+      const { st } = this;
+      const wait = st.nextAt - this.now();
+      if (wait > 0) { await sleepSlices(this.sleep, wait, c.alive); if (!c.alive()) return null; return 'DISPATCH'; } // đợi xong quay lại kiểm tra ưu tiên / ngưỡng
+      let list;
+      try { await this.refreshMe(); list = await this.api.pvpOpponents(); st.errors = 0; this.clearErrors(); }
+      catch (e) {
+        st.errors++; this.log(`Lỗi tải danh sách đối thủ: ${e.message} (lần ${st.errors}, thử lại sau ${this.errWaitSec()}s)`);
+        this.trackError(e); await sleepSlices(this.sleep, this.errWaitMs(), c.alive); return 'DISPATCH';
+      }
+      const my = this.myLevel();
+      if (my == null) { this.log('Chưa biết cấp của bạn (không đọc được cảnh giới), thử lại sau.'); await sleepSlices(this.sleep, CFG.PVP_GAP_MS, c.alive); return 'DISPATCH'; }
+      const pick = PvpCatalog.pick(list, my, st.levelGap);
+      if (!pick) {
+        if (!c.noOppLogged) { this.log(`Chưa có đối thủ nào thấp hơn bạn ${st.levelGap} cấp (cấp bạn ${my}) trong danh sách, tải lại danh sách sau ${CFG.PVP_GAP_MS / 1000}s.`); c.noOppLogged = true; }
+        this.status(`${this.summary()} · đang tìm đối thủ`);
+        await sleepSlices(this.sleep, CFG.PVP_GAP_MS, c.alive);
+        return 'DISPATCH';
+      }
+      c.noOppLogged = false; c.opp = pick;
+      return 'START';
+    }
+
+    async sStart(c) {
+      const { coord, st, api } = this, opp = c.opp;
+      coord.pvpBattle = true; // đặt cờ ngay, trước mọi await
+      if (coord.boss || coord.hunt || coord.um || coord.bt || coord.tower) { coord.pvpBattle = false; return 'DISPATCH'; } // bên ưu tiên cao hơn vừa tới
+      this.log(`Thách đấu ${opp.name} (cấp ${opp.level}, ${opp.score} điểm).`);
+      try { c.match = PvpCatalog.norm(await api.pvpChallenge(opp.id)); st.errors = 0; this.clearErrors(); this.healer.done(); st.nextAt = this.now() + CFG.PVP_GAP_MS; }
+      catch (e) {
+        coord.pvpBattle = false;
+        const cd = PvpCatalog.cooldownSec(e);
+        if (cd != null) { st.nextAt = this.now() + (cd + 1) * 1000; this.log(`Chưa hết thời gian hồi thách đấu, chờ ${cd + 1}s.`); return 'DISPATCH'; }
+        if (isInjuredError(e)) { st.errors = 0; if ((await this.healer.step(c.alive)) === 'stopped') return null; return 'DISPATCH'; }
+        if (/Đang ở trong U Minh/i.test(e.message || '')) { await this.stuckInUMinh(e, c.alive); return 'DISPATCH'; }
+        st.errors++;
+        this.log(`Lỗi thách đấu: ${e.message} (lần ${st.errors}, thử lại sau ${this.errWaitSec()}s)`);
+        try { // có thể đang kẹt trong trận cũ
+          const cur = await this.fetchCurrent().catch(() => null);
+          if (cur) { st.errors = 0; await this.fight(cur, c.alive); return 'DISPATCH'; }
+        } catch (_) {}
+        this.trackError(e);
+        await sleepSlices(this.sleep, this.errWaitMs(), c.alive);
+        return 'DISPATCH';
+      }
+      return 'BATTLE';
+    }
+
+    async sBattle(c) {
+      const r = await this.fight(c.match, c.alive);
+      if (r === 'lose' && this.st.running && this.st.losses >= CFG.PVP_LOSS_STREAK) {
+        this.log(`Đã thua ${this.st.losses} trận liên tiếp, nghỉ đấu pháp ${CFG.PVP_LOSS_PAUSE_MS / 60000} phút rồi đánh tiếp.`);
+        this.st.losses = 0;
+        await sleepSlices(this.sleep, CFG.PVP_LOSS_PAUSE_MS, c.alive);
+      }
+      return 'DISPATCH';
+    }
+  }
+  PvpEngine.TRANSITIONS = {
+    INIT: ['DISPATCH'], DISPATCH: ['DISPATCH', 'YIELD', 'MP_WAIT', 'PICK'], YIELD: ['DISPATCH'], MP_WAIT: ['DISPATCH'],
+    PICK: ['DISPATCH', 'START'], START: ['DISPATCH', 'BATTLE'], BATTLE: ['DISPATCH'],
+  };
+
+
   class ModeMemory {
     constructor(storage) {
       this.storage = storage;
@@ -3963,8 +4451,8 @@
   }
   ModeMemory.KEY = 'tt-auto-boss-run';
   ModeMemory.RKEY = 'tt-auto-boss-resume';
-  ModeMemory.ORDER = ['bt', 'boss', 'um', 'hunt', 'tower', 'farm', 'xh', 'alchemy', 'garden', 'beast', 'war'];
-  ModeMemory.LABELS = { bt: 'Đột phá', boss: 'Boss', um: 'U Minh Cốc', hunt: 'Săn yêu', tower: 'Leo tháp', farm: 'Tầm bảo', xh: 'Xuất hồn', alchemy: 'Luyện đan', garden: 'Linh điền', beast: 'Yêu thú', war: 'Tông Chiến' };
+  ModeMemory.ORDER = ['bt', 'boss', 'um', 'hunt', 'tower', 'farm', 'pvp', 'xh', 'alchemy', 'garden', 'beast', 'meridian', 'pet', 'war'];
+  ModeMemory.LABELS = { bt: 'Đột phá', boss: 'Boss', um: 'U Minh Cốc', hunt: 'Săn yêu', tower: 'Leo tháp', farm: 'Tầm bảo', xh: 'Xuất hồn', alchemy: 'Luyện đan', garden: 'Linh điền', beast: 'Yêu thú', meridian: 'Luyện thể', pet: 'Vuốt ve', pvp: 'Đấu pháp', war: 'Tông Chiến' };
 
   /* ---------------------------------------------------------------------
    *  MỞ NHIỀU: dùng hàng loạt vật phẩm mở được (rương, effect_type "loot_box"), mỗi lượt tối đa CHEST_BATCH_MAX
@@ -4183,7 +4671,7 @@
     module.exports = {
       // class
       BossCatalog, BeastCatalog, BeastEngine, BulkUseCatalog, BulkUseEngine, SellCatalog, SellEngine, BreakthroughCatalog, ModeMemory, AutoLogin, TowerEngine, SkillSwapper, SkillCatalog, HealSkillConfig, HpPillService, PillBook, HpPillConfig, RequestQueue, MpPillConfig, HpGate, EventEmitter, StateMachine, RateLimiter, Coordinator, inBossWindow, PillConfig, MpGate, Healer, PillManager,
-      Engine, BossEngine, MatchEngine, FarmEngine, HuntEngine, BreakthroughEngine, AlchemyEngine, UMinhEngine, GardenEngine, GardenCatalog, XuatHonEngine, XuatHonCatalog, WarEngine, WarCatalog,
+      Engine, BossEngine, MatchEngine, FarmEngine, HuntEngine, BreakthroughEngine, AlchemyEngine, UMinhEngine, GardenEngine, GardenCatalog, XuatHonEngine, XuatHonCatalog, WarEngine, WarCatalog, MeridianEngine, MeridianCatalog, PetEngine, PetCatalog, PvpEngine, PvpCatalog,
       ElementRules, SkillSelector, CombatFormatter, MonsterCatalog, PillCatalog, AlchemyCatalog, UMinhPlanner,
       // tương thích tên cũ (v1.2.8)
       createEngine: d => new BossEngine(d), createFarmEngine: d => new FarmEngine(d), createHuntEngine: d => new HuntEngine(d),
@@ -4210,7 +4698,7 @@
     // mức ưu tiên theo địa chỉ: 0 = boss / đột phá / đổi chiêu; 1 = đòn trong trận của các chế độ (và đọc HP, bộ chiêu); 2 = việc còn lại
     static priorityOf(method, url) {
       if (/^\/api\/(boss\/|character\/breakthrough|character\/skills\/(equip|unequip)|character\/techniques\/activate)/.test(url)) return 0;
-      if (/^\/api\/(dungeon\/farm\/|combat\/hunt\/|tower\/|u-minh\/|sect-war\/|character\/me|pvp\/skills\/equipped)/.test(url)) return 1;
+      if (/^\/api\/(dungeon\/farm\/|combat\/hunt\/|tower\/|u-minh\/|sect-war\/|character\/me|pvp\/(skills\/equipped|challenge|match))/.test(url)) return 1;
       return 2;
     }
 
@@ -4286,8 +4774,8 @@
       if (!r.ok || !j || j.success === false) {
         let msg = (j && (j.message || j.error)) || `HTTP ${r.status}`;
         if (r.status === 401 && !auth) msg += ' (chưa bắt được token: hãy bấm vào 1 tab bất kỳ trong game, hoặc tải lại trang, rồi bấm Bật lại)';
-        const err = new Error(msg); err.status = r.status;
-        err.rateLimited = r.status === 429 || /too many requests|rate.?limit|quá nhiều (yêu cầu|request|lệnh)/i.test(msg); // "quá nhanh" riêng của U Minh Cốc là thời gian hồi bước đi, không dừng cả hàng
+        const err = new Error(msg); err.status = r.status; err.code = j && j.code;
+        err.rateLimited = !(j && j.code === 'PVP_COOLDOWN') && (r.status === 429 || /too many requests|rate.?limit|quá nhiều (yêu cầu|request|lệnh)/i.test(msg)); // PVP_COOLDOWN (15s giữa 2 lần thách đấu) là thời gian hồi riêng, không dừng cả hàng; "quá nhanh" riêng của U Minh Cốc là thời gian hồi bước đi, không dừng cả hàng
         try { err.retryAfter = Number(r.headers && r.headers.get && r.headers.get('retry-after')) || 0; } catch (_) {}
         throw err;
       }
@@ -4301,6 +4789,7 @@
     attack(id, body) { return this.http('POST', `/api/boss/${id}/attack`, body); }
     async getMe() { return (await this.http('GET', '/api/character/me')).data; }
     // tầm bảo
+    async getZoneMonsters(code) { return (await this.http('GET', `/api/dungeon/farm/zones/${encodeURIComponent(code)}/monsters`)).data; }
     async getZones() { return (await this.http('GET', '/api/dungeon/farm/zones')).data; }
     async farmState() { return (await this.http('GET', '/api/dungeon/farm/state')).data; }
     async explore(zoneCode) { return (await this.http('POST', '/api/dungeon/farm/explore', { zoneCode })).data; }
@@ -4321,8 +4810,14 @@
     async getAlchemyState() { return (await this.http('GET', '/api/alchemy/state')).data; }
     // yêu thú: danh sách, xem trước phóng sinh, phóng sinh
     async getBeasts() { return (await this.http('GET', '/api/beasts')).data; }
-    async beastReleasePreview(id) { return (await this.http('GET', `/api/beasts/${id}/release-preview`)).data; }
-    async releaseBeast(id) { return (await this.http('DELETE', `/api/beasts/${id}`)).data; }
+    async pvpOpponents() { return (await this.http('GET', '/api/pvp/opponents')).data; }
+    async pvpStats() { return (await this.http('GET', '/api/pvp/stats')).data; }
+    async pvpMatch() { return (await this.http('GET', '/api/pvp/match')).data; }
+    async pvpChallenge(opponentId) { return (await this.http('POST', '/api/pvp/challenge', { opponentId })).data; }
+    pvpAction(body) { return this.http('POST', '/api/pvp/match/action', body); }
+    async petBeast(id) { return (await this.http('POST', `/api/beasts/${id}/pet`)).data; }
+    async beastReleaseBulkPreview(ids) { return (await this.http('POST', '/api/beasts/release-bulk/preview', { ids })).data; }
+    async beastReleaseBulk(ids) { return (await this.http('POST', '/api/beasts/release-bulk', { ids })).data; }
     // xuất hồn (đi bí cảnh theo giờ, chạy ngầm phía server)
     async xhOptions() { return (await this.http('GET', '/api/xuat-hon/options')).data; }
     async xhStatus() { return (await this.http('GET', '/api/xuat-hon/status')).data; }
@@ -4333,6 +4828,8 @@
     // Linh điền
     async getGardenState() { return (await this.http('GET', '/api/linh-dien/state')).data; }
     async gardenHarvest(slotIndex) { return (await this.http('POST', '/api/linh-dien/harvest', { slotIndex })).data; }
+    async meridianState() { return (await this.http('GET', '/api/meridian/state')).data; }
+    async meridianTrain(n) { return (await this.http('POST', '/api/meridian/train', { n })).data; }
     async gardenPlant(slotIndex, seedId) { return (await this.http('POST', '/api/linh-dien/plant', { slotIndex, seedId })).data; }
     // U Minh Cốc (spawn: top | bottom | left | right; dir: up | down | left | right)
     async uminhState(since) { return (await this.http('GET', '/api/u-minh/state' + (since != null ? `?since=${since}` : ''))).data; }
@@ -4369,7 +4866,7 @@
    *    'boss:toggle' | 'boss:size'(size, checked) | 'boss:mode'(size, mode)
    *    'farm:toggle' | 'farm:zone'(code)
    *    'hunt:toggle' | 'hunt:monster'(id) | 'hunt:refresh'
-   *    'bt:toggle'(checked) | 'mp:toggle'(k, checked) | 'mp:range'(k, lo, hi) | 'mgate:toggle'(k, checked) | 'mgate:range'(k, lo, hi) | 'hgate:toggle'(k, checked) | 'hgate:range'(k, lo, hi) | 'pill:refill' | 'alchemy:toggle' | 'alchemy:recipe'(id) | 'alchemy:refresh' | 'bulk:main'(checked) | 'bulk:add' | 'bulk:set'(oldId, newId) | 'bulk:toggle'(id, checked) | 'bulk:remove'(id) | 'um:toggle' | 'um:gate'(key) | 'tower:toggle' | 'swap:toggle'(checked) | 'login:config'({enabled,user,pass}) | 'resume:toggle'(checked) | 'beast:toggle' | 'beast:filter'({rar,keep}) | 'beast:hatch' | 'beast:release' | 'swap:pool'(ids) | 'skill:lock'(id) | 'garden:toggle' | 'garden:seed'(id) | 'garden:refresh' | 'garden:harvest'(on) | 'garden:plant'(on) | 'skill:equip'(inventoryId) | 'skill:unequip'(inventoryId) | 'skill:refresh' | 'hp:toggle'(mode, checked) | 'hp:range'(mode, lo, hi) | 'pillbook:select'(kind, id, name) | 'pillbook:refresh' | 'pill:range'(lo, hi) | 'gate:range'(lo, hi)
+   *    'bt:toggle'(checked) | 'mp:toggle'(k, checked) | 'mp:range'(k, lo, hi) | 'mgate:toggle'(k, checked) | 'mgate:range'(k, lo, hi) | 'hgate:toggle'(k, checked) | 'hgate:range'(k, lo, hi) | 'pill:refill' | 'alchemy:toggle' | 'alchemy:recipe'(id) | 'alchemy:refresh' | 'bulk:main'(checked) | 'bulk:add' | 'bulk:set'(oldId, newId) | 'bulk:toggle'(id, checked) | 'bulk:remove'(id) | 'um:toggle' | 'um:gate'(key) | 'tower:toggle' | 'swap:toggle'(checked) | 'login:config'({enabled,user,pass}) | 'resume:toggle'(checked) | 'beast:toggle' | 'beast:filter'({rar,keep}) | 'beast:hatch' | 'beast:release' | 'swap:pool'(k, id) | 'skill:lock'(id) | 'garden:toggle' | 'garden:seed'(id) | 'garden:refresh' | 'garden:harvest'(on) | 'garden:plant'(on) | 'skill:equip'(inventoryId) | 'skill:unequip'(inventoryId) | 'skill:refresh' | 'hp:toggle'(mode, checked) | 'hp:range'(mode, lo, hi) | 'pillbook:select'(kind, id, name) | 'pillbook:refresh' | 'pill:range'(lo, hi) | 'gate:range'(lo, hi)
    * ===================================================================== */
 
   const COLORS = { // Bảng màu log (func4-8: func4 dùng cho đột phá, còn lại định nghĩa sẵn)
@@ -4479,12 +4976,16 @@
       this.$lUser = q('#ab-login-user'); this.$lPass = q('#ab-login-pass'); this.$lOn = q('#ab-login-on'); this.$lShow = q('#ab-login-show'); this.$lStatus = q('#ab-login-status'); this.$resume = q('#ab-resume'); this.$resumeInfo = q('#ab-resume-info');
       this.$xh = q('#ab-xh-toggle'); this.$xhMap = q('#ab-xh-map'); this.$xhDur = q('#ab-xh-dur'); this.$xhStatus = q('#ab-xh-status'); this.$xhInfo = q('#ab-xh-info');
       this.$um = q('#ab-um-toggle'); this.$umGate = q('#ab-um-gate'); this.$umStatus = q('#ab-um-status');
+      this.$mer = q('#ab-mer-toggle'); this.$merSel = q('#ab-mer-sel'); this.$merInfo = q('#ab-mer-info'); this.$merStatus = q('#ab-mer-status');
+      this.$pet = q('#ab-pet-toggle'); this.$petStatus = q('#ab-pet-status');
+      this.$pvp = q('#ab-pvp-toggle'); this.$pvpStatus = q('#ab-pvp-status'); this.$pvpCount = q('#ab-pvp-count'); this.$pvpGap = q('#ab-pvp-gap');
       this.$war = q('#ab-war-toggle'); this.$warTerr = q('#ab-war-terr'); this.$warInfo = q('#ab-war-info'); this.$warStatus = q('#ab-war-status');
       this.$drag = q('#ab-drag'); this.$body = q('#ab-body'); this.$ctrl = q('#ab-ctrl');
       this.live = {}; this.sumText = {}; // trạng thái bật + dòng trạng thái ngắn của từng dòng trong thang
       this.$min = q('#ab-min'); this.$minCtrl = q('#ab-min-ctrl'); this.$minLog = q('#ab-min-log'); this.$ui = q('#ab-ui');
       this.$stripRun = q('#ab-strip-run');
-      this.$stripRun.addEventListener('click', e => { const b = e.target.closest('[data-stop]'); const sw = b && this.panel.querySelector(`.ab-row[data-key="${b.dataset.stop}"] .ab-sw`); if (sw) sw.click(); }); this.$stripTix = q('#ab-strip-tix'); this.$stripLog = q('#ab-strip-log'); this.$railN = q('#ab-rail-n');
+      this.stripOpen = false; // nhiều chế độ chạy cùng lúc: mặc định gộp thành 1 nút, chạm để mở danh sách
+      this.$stripRun.addEventListener('click', e => { if (e.target.closest('[data-fold]')) { this.stripOpen = !this.stripOpen; this.renderStrip(); return; } const b = e.target.closest('[data-stop]'); const sw = b && this.panel.querySelector(`.ab-row[data-key="${b.dataset.stop}"] .ab-sw`); if (sw) sw.click(); }); this.$stripTix = q('#ab-strip-tix'); this.$stripLog = q('#ab-strip-log'); this.$railN = q('#ab-rail-n');
       this.tix = {}; this.$req = q('#ab-req'); this.$stripReq = q('#ab-strip-req');
       this.dual = {}; // 'hp-boss' | 'mp-farm' | 'mg-um' | 'hg-tower' ... → DualSlider
       for (const sp of DUAL_SPECS) for (const k of sp.modes) this.dual[`${sp.p}-${k}`] = new DualSlider({ loEl: q(`#ab-${sp.p}-${k}-lo`), hiEl: q(`#ab-${sp.p}-${k}-hi`), defLo: sp.lo, defHi: sp.hi, storage, key: null, min: 5, max: 95, step: 5, tickValues: Array.from({ length: 19 }, (_, i) => 5 + i * 5), labelStep: 2 });
@@ -4500,6 +5001,9 @@
         xh: ['▶ Bật xuất hồn', '■ Tắt xuất hồn'],
         garden: ['▶ Bật Linh Điền', '■ Tắt Linh Điền'],
         beast: ['▶ Bật tự động yêu thú', '■ Tắt tự động yêu thú'],
+        meridian: ['▶ Bật luyện thể', '■ Tắt luyện thể'],
+        pet: ['▶ Bật vuốt ve', '■ Tắt vuốt ve'],
+        pvp: ['▶ Bật đấu pháp', '■ Tắt đấu pháp'],
         war: ['▶ Bật Tông Chiến', '■ Tắt Tông Chiến'],
       };
     }
@@ -4667,7 +5171,7 @@
       #tt-auto-boss-panel .ab-hprow{display:flex;justify-content:space-between;color:var(--mute)}
       #tt-auto-boss-panel .ab-hprow b{color:var(--paper)}
       #tt-auto-boss-panel .ab-skillrow{display:flex;gap:6px;align-items:center}
-      #tt-auto-boss-panel .ab-skillrow+.ab-skillrow,#tt-auto-boss-panel #ab-swap-pool-list select+select{margin-top:6px}
+      #tt-auto-boss-panel .ab-skillrow+.ab-skillrow,#tt-auto-boss-panel .ab-poolrow{display:flex;align-items:center;gap:6px;margin-top:6px}#tt-auto-boss-panel .ab-poolrow span{flex:0 0 52px}#tt-auto-boss-panel .ab-poolrow select{flex:1;min-width:0}
       #tt-auto-boss-panel .ab-skill{flex:1;min-width:0;padding:6px 8px;background:var(--ink2);border:1px solid var(--line);border-radius:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       #tt-auto-boss-panel #ab-skills{margin-top:10px}
       #tt-auto-boss-panel .ab-skill-off{opacity:.55;text-decoration:line-through}
@@ -4708,8 +5212,10 @@
       #tt-auto-boss-panel.cp #ab-rail-n{margin-top:auto;padding:12px 0;text-align:center;color:var(--jade);font-weight:500;font-size:var(--fs-l);line-height:1}
       #tt-auto-boss-panel.cp #ab-strip{display:block;flex:0 0 auto;padding:6px 12px 2px;background:var(--ink2);border-bottom:1px solid var(--line)}
       #tt-auto-boss-panel.cp .ab-srow{display:flex;justify-content:space-between;gap:8px;font-size:var(--fs-s);line-height:1.4}
-      #tt-auto-boss-panel.cp #ab-strip-run{min-width:0;display:flex;flex-wrap:wrap;gap:4px;color:var(--jade)}
-      #tt-auto-boss-panel .ab-run{height:32px;padding:0 10px;cursor:pointer;color:var(--jade);background:#17312b;border:1px solid var(--jade-d);border-radius:16px;font-size:var(--fs-s);white-space:nowrap}
+      #tt-auto-boss-panel.cp #ab-strip-run{min-width:0;flex:1 1 auto;display:flex;flex-wrap:wrap;gap:4px;color:var(--jade)}
+      #tt-auto-boss-panel .ab-fold{font-weight:500}
+      #tt-auto-boss-panel .ab-srow2{flex-wrap:wrap;justify-content:flex-start;column-gap:10px}
+      #tt-auto-boss-panel .ab-run{height:30px;padding:0 9px;cursor:pointer;color:var(--jade);background:#17312b;border:1px solid var(--jade-d);border-radius:16px;font-size:var(--fs-s);white-space:nowrap}
       #tt-auto-boss-panel .ab-run:hover{border-color:var(--cin);color:var(--cin)}
       #tt-auto-boss-panel .ab-more{border:1px solid var(--line);border-radius:8px;background:var(--ink2)}
       #tt-auto-boss-panel .ab-more>summary{cursor:pointer;min-height:36px;display:flex;align-items:center;padding:0 10px;color:var(--mute);list-style:none}
@@ -4803,7 +5309,7 @@
       <div id="ab-rail-n" aria-live="polite">0</div>
     </div>
     <div id="ab-body">
-    <div id="ab-strip"><div class="ab-srow"><span id="ab-strip-run" data-n="0"></span><span id="ab-strip-tix"></span></div><div class="ab-srow"><span id="ab-strip-req"></span></div><button type="button" id="ab-strip-log" title="Chạm để xem toàn bộ log"></button></div>
+    <div id="ab-strip"><div class="ab-srow"><span id="ab-strip-run" data-n="0"></span></div><div class="ab-srow ab-srow2"><span id="ab-strip-req"></span><span id="ab-strip-tix"></span></div><button type="button" id="ab-strip-log" title="Chạm để xem toàn bộ log"></button></div>
     <div id="ab-ctrl">
       <div class="ab-tabs" role="tablist">
         <button class="ab-tab" role="tab" data-tab="fight" aria-selected="true">Chiến đấu</button>
@@ -4925,7 +5431,7 @@
             <label class="ab-chip"><input type="checkbox" data-rar="su_thi"> Sử thi</label>
             <label class="ab-chip"><input type="checkbox" data-rar="huyen_thoai"> Huyền thoại</label>
           </div>
-          <div id="ab-beast-warn" class="ab-status" style="display:none;color:var(--gold)">⚠ Sử thi / Huyền thoại: chế độ TỰ ĐỘNG không bao giờ phóng sinh hai loại này. Chỉ nút "Phóng sinh ngay" làm được, sau khi bạn xác nhận.</div>
+          <div id="ab-beast-warn" class="ab-status" style="display:none;color:var(--gold)">⚠ Huyền thoại: chế độ TỰ ĐỘNG không bao giờ phóng sinh loại này. Chỉ nút "Phóng sinh ngay" làm được, sau khi bạn xác nhận. Sử thi được phóng sinh tự động nếu bạn tick ô Sử thi.</div>
           <label class="ab-field">Giữ lại (không phóng sinh)
             <select id="ab-beast-keep" title="Thú từ số sao này trở lên luôn được giữ lại.">
               <option value="0">Không giữ</option><option value="1">Giữ lại từ 1★ trở lên</option><option value="2">Giữ lại từ 2★ trở lên</option><option value="3">Giữ lại từ 3★ trở lên</option><option value="4">Giữ lại từ 4★ trở lên</option><option value="5">Giữ lại từ 5★ trở lên</option>
@@ -4937,8 +5443,28 @@
           </div>
           <button id="ab-beast-toggle" class="ab-act" title="Tự động: phóng sinh (Thường / Hiếm theo bộ lọc) để có chỗ, rồi mở trứng; kiểm tra lại mỗi 60 phút.">▶ Bật tự động yêu thú</button>
           <div id="ab-beast-status" class="ab-status"></div>`)}
+        ${row('meridian', '', 'Luyện thể', `
+          <label class="ab-field">Mạch<select id="ab-mer-sel" title="Chọn 1 trong 8 mạch (Kỳ Kinh Bát Mạch). Tool luyện lần lượt từng huyệt của mạch này, mỗi lần chọn huyệt rẻ nhất (ít đá, rồi ít tu vi; bằng nhau thì huyệt số nhỏ). Mạch đầy thì tự dừng; thiếu đá hoặc tu vi thì thử lại sau 5 phút.">
+            <option value="">— Chọn mạch —</option>${MeridianCatalog.MAI.map(m => `<option value="${m.id}">${m.name} · tăng ${m.stat} (${m.count} huyệt: #${m.from}-#${m.from + m.count - 1})</option>`).join('')}</select></label>
+          <button id="ab-mer-toggle" class="ab-act" title="Chạy ngầm song song với các chế độ khác (chỉ gọi vài lệnh mỗi lần luyện xong). Mỗi lượt luyện có giờ chờ của server.">▶ Bật luyện thể</button>
+          <div id="ab-mer-info" class="ab-status"></div>
+          <div id="ab-mer-status" class="ab-status"></div>`)}
+        ${row('pet', '', 'Vuốt ve yêu thú', `
+          <button id="ab-pet-toggle" class="ab-act" title="Vuốt ve các yêu thú đang xuất chiến để tăng độ thân mật (+5% mỗi lần, mỗi con hồi 1 giờ). Tool tự chờ đúng thời gian hồi rồi vuốt tiếp, chạy ngầm cùng các chế độ khác.">▶ Bật vuốt ve</button>
+          <div id="ab-pet-status" class="ab-status"></div>`)}
+        ${row('pvp', '', 'Đấu pháp', `
+          <label class="ab-field">Số trận (đánh đủ thì tự tắt)<input id="ab-pvp-count" class="ab-in" type="number" min="1" max="999" step="1" value="10" title="Đánh đủ số trận này rồi tự tắt. Mỗi lần bật là đếm lại từ 0."></label>
+          <label class="ab-field">Đối thủ thấp hơn mình tối thiểu (cấp)<input id="ab-pvp-gap" class="ab-in" type="number" min="0" max="99" step="1" value="10" title="Chỉ thách đấu người có cấp <= cấp của bạn - số này. Trong số đó chọn người nhiều điểm nhất. Không ai phù hợp thì tải lại danh sách sau mỗi 16 giây."></label>
+          <button id="ab-pvp-toggle" class="ab-act" title="Chỉ đánh chế độ challenge (tính điểm Elo, không bị phạt karma), cách nhau 16 giây. Không đổi chiêu. Ưu tiên thấp nhất: nhường boss, U Minh Cốc, săn yêu, leo tháp. Thua 3 trận liên tiếp thì nghỉ 30 phút.">▶ Bật đấu pháp</button>
+          <div id="ab-pvp-status" class="ab-status"></div>
+<details class="ab-more"><summary>Ngưỡng HP / MP · hồi máu</summary>
+          ${hp('pvp')}
+          ${mp('pvp')}
+          ${gt('pvp')}
+          ${hs('pvp')}
+          </details>`)}
         ${row('war', '', 'Tông Chiến', `
-          <label class="ab-field">Lãnh địa<select id="ab-war-terr" title="Chỉ hiện lãnh địa tông bạn đã đăng ký. Tự chọn: vòng cao hơn trước, bằng nhau thì cái đứng trước trong danh sách. Bạn chọn tay thì giữ tới 20:55, sau đó về tự chọn. Quét lại khi bật và mỗi giờ lúc xx:25. Đã vào lãnh địa trong ngày thì không đổi được tới hôm sau."><option value="auto">Tự chọn (vòng cao trước)</option></select></label>
+          <label class="ab-field">Lãnh địa<select id="ab-war-terr" title="Hiện lãnh địa tông bạn đang chiếm [Đã có] hoặc đã đăng ký chiếm [Sẽ chiếm]; ⚠ = lãnh địa đang chiếm bị tông khác đăng ký chiếm. Tự chọn: lãnh địa chưa có (sẽ chiếm) trước lãnh địa đã có, rồi vòng cao hơn, bằng nhau thì cái đứng trước trong danh sách. Bạn chọn tay thì giữ tới 20:55, sau đó về tự chọn. Quét lại khi bật và mỗi giờ lúc xx:25. Đã vào lãnh địa trong ngày thì không đổi được tới hôm sau."><option value="auto">Tự chọn (vòng cao trước)</option></select></label>
           <button id="ab-war-toggle" class="ab-act" title="Bật cả ngày, chỉ hành động trong khung giờ sự kiện. Đổi chiêu rồi vào lãnh địa trước giờ đánh (server chụp bộ chiêu lúc vào). Đánh người chơi khác tông (power tối đa 12000) trước, hết thì đánh thủ vệ (tối đa 5 lần thắng), hết nữa thì chờ người chơi xuất hiện. Dừng khi hết giờ hoặc đủ lượt tối đa của server.">▶ Bật Tông Chiến</button>
           <div id="ab-war-info" class="ab-status"></div>
           <div id="ab-war-status" class="ab-status"></div>
@@ -4948,10 +5474,10 @@
 
       <div class="ab-pane" data-pane="kit">
         ${sect('Võ kỹ', 'tối đa 3 chiêu; đổi chiêu có hiệu lực từ trận sau', `
-          <div class="ab-line"><label class="ab-chk" style="flex:1" title="Trước mỗi trận boss: nếu bộ chiêu đang mang đã có chiêu công kích khắc hệ boss thì giữ nguyên. Nếu chưa, tìm trong các chiêu dự bị (ô &quot;Chiêu dùng để thay&quot;) chiêu khắc mạnh nhất và đổi tối thiểu (còn ô trống thì chỉ gắn thêm; hết ô thì tháo 1 chiêu công kích yếu nhất không khắc). Không có chiêu dự bị khắc thì giữ nguyên."><input type="checkbox" id="ab-autoswap" checked> Tự đổi chiêu khắc hệ (chỉ trước boss)</label>
+          <div class="ab-line"><label class="ab-chk" style="flex:1" title="Trước mỗi trận boss, săn yêu (hệ quái đang chọn), tầm bảo (hệ con lớn nhất của bí cảnh) và trước khi vào U Minh Cốc (hệ quái theo cảnh giới: Luyện Hư Thổ, Hợp Thể Hỏa, Đại Thừa Thủy): nếu bộ chiêu đang mang đã có chiêu công kích khắc hệ boss thì giữ nguyên. Nếu chưa, tìm trong các chiêu dự bị (ô &quot;Chiêu dự bị&quot; của hệ khắc) và đổi tối thiểu (còn ô trống thì chỉ gắn thêm; hết ô thì tháo 1 chiêu công kích yếu nhất không khắc). Nếu bộ chiêu chưa có chiêu hồi máu thì gắn chiêu hồi máu dự bị. Ô dự bị trống thì giữ nguyên."><input type="checkbox" id="ab-autoswap" checked> Tự đổi chiêu khắc hệ (boss, săn yêu, tầm bảo, U Minh Cốc)</label>
             <button id="ab-skills-refresh" class="ab-mini" title="Tải lại danh sách chiêu">↻</button></div>
           <div id="ab-swap-pool">
-            <div class="ab-status" style="margin-bottom:6px" title="Chiêu dự bị: chỉ khi bộ chiêu đang mang không có chiêu khắc hệ boss, tool mới tìm trong các chiêu chọn ở đây. Để trống cả 3 ô = không tìm, giữ nguyên bộ chiêu.">Chiêu dùng để thay (3 ô; trống hết = không đổi):</div>
+            <div class="ab-status" style="margin-bottom:6px" title="Chiêu dự bị cố định, chỉ đổi khi bạn chọn (tool tự đổi chiêu hay bạn đổi chiêu ngoài game đều không làm đổi). Mỗi hệ 1 chiêu công kích để khắc boss + 1 chiêu hồi máu. Ô trống = không đổi cho hệ đó.">Chiêu dự bị (mỗi hệ 1 công kích + 1 hồi máu):</div>
             <div id="ab-swap-pool-list"></div>
           </div>
           <div id="ab-skills"></div>
@@ -5029,7 +5555,7 @@
       const OPEN_KEY = 'tt-auto-boss-open';
       const { panel, storage } = this;
       const open = storage.getJSON(OPEN_KEY, null) || {};
-      const TARGET = { boss: '#ab-toggle', um: '#ab-um-toggle', hunt: '#ab-hunt-toggle', tower: '#ab-tower-toggle', farm: '#ab-farm-toggle', xh: '#ab-xh-toggle', alchemy: '#ab-alchemy-toggle', garden: '#ab-garden-toggle', beast: '#ab-beast-toggle', war: '#ab-war-toggle', bt: '#ab-bt-on' };
+      const TARGET = { boss: '#ab-toggle', um: '#ab-um-toggle', hunt: '#ab-hunt-toggle', tower: '#ab-tower-toggle', farm: '#ab-farm-toggle', xh: '#ab-xh-toggle', alchemy: '#ab-alchemy-toggle', garden: '#ab-garden-toggle', beast: '#ab-beast-toggle', war: '#ab-war-toggle', meridian: '#ab-mer-toggle', pet: '#ab-pet-toggle', pvp: '#ab-pvp-toggle', bt: '#ab-bt-on' };
       // giao diện máy tính: mở / gập tại chỗ và nhớ lại; giao diện nhỏ: mở thành trang riêng, không nhớ
       const fold = (row, on, save) => {
         row.dataset.open = on ? '1' : '0';
@@ -5091,11 +5617,17 @@
     // dải trạng thái + thanh thu gọn của giao diện nhỏ
     renderStrip() {
       if (!this.$stripRun) return;
-      const NAMES = { boss: 'Boss', um: 'U Minh', hunt: 'Săn yêu', tower: 'Leo tháp', farm: 'Tầm bảo', xh: 'Xuất hồn', bt: 'Đột phá', alchemy: 'Luyện đan', garden: 'Linh điền', beast: 'Yêu thú', war: 'Tông Chiến' };
+      const NAMES = { boss: 'Boss', um: 'U Minh', hunt: 'Săn yêu', tower: 'Leo tháp', farm: 'Tầm bảo', xh: 'Xuất hồn', bt: 'Đột phá', alchemy: 'Luyện đan', garden: 'Linh điền', beast: 'Yêu thú', meridian: 'Luyện thể', pet: 'Vuốt ve', pvp: 'Đấu pháp', war: 'Tông Chiến' };
       const run = Object.keys(NAMES).filter(k => this.live[k]);
       this.$stripRun.dataset.n = String(run.length);
       this.$stripRun.textContent = run.length ? '' : 'Chưa bật chế độ nào';
-      for (const k of run) { // mỗi chế độ đang chạy là 1 nút: chạm để tắt, không phải đổi tab
+      const fold = run.length > CFG.STRIP_FOLD_OVER; // nhiều hơn ngưỡng thì gộp lại (giữ thanh trạng thái gọn trên màn nhỏ)
+      if (fold) {
+        const f = document.createElement('button'); f.type = 'button'; f.className = 'ab-run ab-fold'; f.dataset.fold = '1';
+        f.textContent = this.stripOpen ? `${run.length} chế độ đang chạy ▴` : `${run.length} chế độ đang chạy ▾`; f.title = this.stripOpen ? 'Thu gọn' : 'Chạm để xem và tắt từng chế độ';
+        this.$stripRun.appendChild(f);
+      }
+      for (const k of (fold && !this.stripOpen ? [] : run)) { // mỗi chế độ đang chạy là 1 nút: chạm để tắt, không phải đổi tab
         const b = document.createElement('button'); b.type = 'button'; b.className = 'ab-run'; b.dataset.stop = k; b.title = `Chạm để tắt ${NAMES[k]}`; b.textContent = `${NAMES[k]} ✕`;
         this.$stripRun.appendChild(b);
       }
@@ -5169,6 +5701,11 @@
       this.$tower.addEventListener('click', () => this.emit('tower:toggle'));
       this.$xh.addEventListener('click', () => this.emit('xh:toggle'));
       this.$war.addEventListener('click', () => this.emit('war:toggle'));
+      this.$mer.addEventListener('click', () => this.emit('meridian:toggle'));
+      this.$pet.addEventListener('click', () => this.emit('pet:toggle'));
+      this.$pvp.addEventListener('click', () => this.emit('pvp:toggle'));
+      for (const el of [this.$pvpCount, this.$pvpGap]) el.addEventListener('change', () => this.emit('pvp:cfg', this.pvpCfg()));
+      this.$merSel.addEventListener('change', () => this.emit('meridian:mai', this.$merSel.value === '' ? null : Number(this.$merSel.value)));
       this.$warTerr.addEventListener('change', () => this.emit('war:terr', this.$warTerr.value));
       this.$xhMap.addEventListener('change', () => this.emit('xh:map', this.$xhMap.value));
       this.$xhDur.addEventListener('change', () => this.emit('xh:dur', Number(this.$xhDur.value)));
@@ -5191,7 +5728,7 @@
     get zone() { return this.$zone.value; }
     get monsterValue() { return Number(this.$monster.value); }
     setRunning(key, running) {
-      const btn = ({ boss: this.$boss, farm: this.$farm, hunt: this.$hunt, alchemy: this.$alchemy, um: this.$um, tower: this.$tower, xh: this.$xh, garden: this.$garden, beast: this.$beast, war: this.$war })[key];
+      const btn = ({ boss: this.$boss, farm: this.$farm, hunt: this.$hunt, alchemy: this.$alchemy, um: this.$um, tower: this.$tower, xh: this.$xh, garden: this.$garden, beast: this.$beast, meridian: this.$mer, pet: this.$pet, pvp: this.$pvp, war: this.$war })[key];
       btn.textContent = this.labels[key][running ? 1 : 0]; btn.dataset.on = running ? '1' : '0';
       this.markRow(key, running);
     }
@@ -5233,7 +5770,7 @@
     setSkillPending(text) { this.$skillPending.textContent = text || ''; }
     setSkills(inv, realm, busy, swap) {
       const lockedIds = (swap && swap.locked) || new Set();
-      this.renderSwapPool(inv, realm, (swap && swap.pool) || new Set());
+      this.renderSwapPool(inv, realm, (swap && swap.pool) || SkillCatalog.normPool());
       const box = this.$skills; box.innerHTML = '';
       const row = () => { const r = document.createElement('div'); r.className = 'ab-skillrow'; box.appendChild(r); return r; };
       // lệnh đang chờ (đổi ngay sau trận): chiêu chờ tháo hiện mờ + nút Hủy, ô của nó tính là trống để chọn chiêu thay ngay; chiêu chờ gắn hiện nét đứt + nút Hủy
@@ -5271,22 +5808,27 @@
         r.append(sel, b);
       }
     }
-    // 3 ô chọn chiêu dùng để thay (chỉ chiêu công kích / hồi máu); giữ lựa chọn cũ
+    // 6 ô chiêu dự bị cố định: 5 hệ (chỉ chiêu công kích của hệ đó) + 1 ô hồi máu. Chỉ đổi khi bạn chọn, tool và game không tự xoay.
     renderSwapPool(inv, realm, pool) {
       const list = this.$swapPoolList; list.innerHTML = '';
-      const opts = SkillCatalog.all(inv).filter(x => (x.skill_kind === 'attack' || x.skill_kind === 'heal') && x.is_equippable !== 0)
-        .sort((a, b) => (a.skill_kind === b.skill_kind ? 0 : a.skill_kind === 'attack' ? -1 : 1) || SkillCatalog.byMp(a, b));
-      const chosen = [...pool].filter(id => opts.some(x => x.id === id)).slice(0, 3);
-      for (let i = 0; i < 3; i++) {
-        const sel = document.createElement('select'); sel.dataset.pool = String(i);
-        const none = document.createElement('option'); none.value = ''; none.textContent = '— Không chọn —'; sel.appendChild(none);
+      const all = SkillCatalog.all(inv).filter(x => x.is_equippable !== 0 && x.is_equippable !== false);
+      pool = SkillCatalog.normPool(pool);
+      for (const k of SkillCatalog.POOL_KEYS) {
+        const row = document.createElement('div'); row.className = 'ab-poolrow';
+        const lab = document.createElement('span'); lab.textContent = k === 'heal' ? 'Hồi máu' : k; row.appendChild(lab);
+        const sel = document.createElement('select'); sel.dataset.pool = k;
+        const none = document.createElement('option'); none.value = '0'; none.textContent = '— Không chọn —'; sel.appendChild(none);
+        const opts = all.filter(x => k === 'heal' ? x.skill_kind === 'heal' : x.skill_kind === 'attack' && x.skill_element === k).sort(SkillCatalog.byMp);
         for (const x of opts) {
           const o = document.createElement('option'), locked = typeof realm === 'number' && (x.required_realm || 0) > realm;
           o.value = String(x.id); o.textContent = (locked ? '🔒 ' : '') + (x.is_equipped ? '✔ ' : '') + SkillCatalog.label(x); o.title = x.description || ''; sel.appendChild(o);
         }
-        if (chosen[i] != null) sel.value = String(chosen[i]);
-        sel.addEventListener('change', () => this.emit('swap:pool', [...list.querySelectorAll('select')].map(e => Number(e.value)).filter(Boolean)));
-        list.appendChild(sel);
+        if (pool[k] && !opts.some(x => x.id === pool[k])) { // chiêu dự bị không còn trong danh sách: vẫn giữ lựa chọn, hiện mờ
+          const o = document.createElement('option'); o.value = String(pool[k]); o.textContent = `#${pool[k]} (không còn)`; sel.appendChild(o);
+        }
+        sel.value = String(pool[k] || 0);
+        sel.addEventListener('change', () => this.emit('swap:pool', k, Number(sel.value)));
+        row.appendChild(sel); list.appendChild(row);
       }
     }
     setSeeds(list, selectedId) {
@@ -5308,7 +5850,7 @@
       const rar = {}; this.panel.querySelectorAll('[data-rar]').forEach(c => { rar[c.dataset.rar] = c.checked; });
       return { rar, keep: Number(this.$beastKeep.value) || 0 };
     }
-    showBeastWarn() { const on = this.panel.querySelector('[data-rar="su_thi"]').checked || this.panel.querySelector('[data-rar="huyen_thoai"]').checked; this.$beastWarn.style.display = on ? '' : 'none'; }
+    showBeastWarn() { const on = this.panel.querySelector('[data-rar="huyen_thoai"]').checked; this.$beastWarn.style.display = on ? '' : 'none'; }
     setBeastFilter(f) { this.panel.querySelectorAll('[data-rar]').forEach(c => { c.checked = !!(f.rar && f.rar[c.dataset.rar]); }); this.$beastKeep.value = String(f.keep || 0); this.showBeastWarn(); }
     // mở nhiều: option.value là chỉ số trong danh sách (key có thể là số hoặc tên), nhớ ánh xạ ở this.chestKeys
     chestKey(v) { return this.chestKeys ? this.chestKeys[Number(v)] : null; }
@@ -5360,15 +5902,29 @@
     setXhChoice(sel, dur) { this.$xhMap.value = [...this.$xhMap.options].some(o => o.value === sel) ? sel : 'auto'; this.$xhDur.value = String(dur); }
     setXhInfo(text) { this.$xhInfo.textContent = text || ''; }
     // Danh sách lãnh địa của tông (value = code); chosen = đang là lựa chọn tay (còn hạn), ngược lại hiện "Tự chọn" kèm lãnh địa đang dùng
-    setWarTerritories(list, code, chosen) {
+    setWarTerritories(list, code, chosen, sectId) {
       const sel = this.$warTerr, cur = (list || []).find(t => t.code === code);
       sel.textContent = '';
       const add = (v, t) => { const o = document.createElement('option'); o.value = v; o.textContent = t; sel.appendChild(o); };
-      add('auto', `Tự chọn (vòng cao trước)${!chosen && cur ? ` → ${cur.name}` : ''}`);
-      for (const t of list || []) add(t.code, `${t.name} · ${t.ringLabel || t.ring}`);
+      add('auto', `Tự chọn (chưa có trước, vòng cao trước)${!chosen && cur ? ` → ${cur.name}` : ''}`);
+      for (const t of list || []) add(t.code, `${WarCatalog.tag(t, sectId)} ${t.name} · ${t.ringLabel || t.ring}`.trim());
       sel.value = chosen && cur ? code : 'auto';
     }
     setWarInfo(text) { this.$warInfo.textContent = text || ''; }
+    setMeridianMai(id) { this.$merSel.value = id == null ? '' : String(id); }
+    setMeridianInfo(text) { this.$merInfo.textContent = text || ''; }
+    setMeridianStatus(text) { this.$merStatus.textContent = text || ''; this.setSum('meridian', text); }
+    // đọc 2 ô số của Đấu pháp (số trận >= 1, chênh cấp >= 0); giá trị sai thì về mặc định
+    pvpCfg() {
+      const n = v => { const x = Math.floor(Number(v)); return Number.isFinite(x) ? x : NaN; };
+      let count = n(this.$pvpCount.value), gap = n(this.$pvpGap.value);
+      if (!(count >= 1)) count = CFG.PVP_DEFAULT_COUNT;
+      if (!(gap >= 0)) gap = CFG.PVP_DEFAULT_LEVEL_GAP;
+      return { count: Math.min(count, 999), gap: Math.min(gap, 99) };
+    }
+    setPvpCfg(c) { if (c && c.count >= 1) this.$pvpCount.value = String(c.count); if (c && c.gap >= 0) this.$pvpGap.value = String(c.gap); }
+    setPvpStatus(text) { this.$pvpStatus.textContent = text || ''; this.setSum('pvp', text); }
+    setPetStatus(text) { this.$petStatus.textContent = text || ''; this.setSum('pet', text); }
     setWarStatus(text) { this.$warStatus.textContent = text || ''; this.setSum('war', text); }
     setXhStatus(text) { this.$xhStatus.textContent = text || ''; this.setSum('xh', text); }
     setTowerStatus(text) { this.$towerStatus.textContent = text || ''; this.setSum('tower', text); }
@@ -5581,6 +6137,9 @@
       this.xh = new XuatHonEngine({ ...common, blockers: () => this.xhBlockers() }); this.xhTries = 0; this.xhTimer = null;
       this.garden = new GardenEngine(common);
       this.war = new WarEngine(common);
+      this.meridian = new MeridianEngine(common);
+      this.pet = new PetEngine(common);
+      this.pvp = new PvpEngine(common);
       this.beast = new BeastEngine(common); this.beastBusy = false; this.beastTries = 0;
       this.sell = new SellEngine(common); this.sellBusy = false; this.sellSel = null; this.sellQty = 1; this.sellList = []; this.sellTries = 0; this.sellTimer = null;
       this.chest = new BulkUseEngine(common); this.chestBusy = false; this.chestSel = null; this.chestTimer = null; this.chestTries = 0;
@@ -5591,14 +6150,14 @@
       this.shared.coord.skillGate = () => this.flushSkillQueue(); // các chế độ gọi ngay giữa hai trận
       this.recipeTries = 0; this.recipeTimer = null;
       // trạng thái chọn yêu
-      this.monsterPicked = false; this.monsterTries = 0; this.monsterTimer = null;
+      this.monsterPicked = false; this.monsterSaved = Number(this.storage.getRaw('tt-auto-boss-hunt-monster')) || null; this.monsterTries = 0; this.monsterTimer = null;
     }
 
     uiLog(m) { this.view.appendLog('[UI]', COLORS.tool, m); }
     pipeLog(engine, tag, color) { engine.on('log', m => this.view.appendLog(tag, color, m)); }
 
     // Watchdog: 15s xem một lần, chế độ nào lỗi liên tục quá WATCHDOG_IDLE_MS thì reset mềm
-    watchdogTick() { for (const e of [this.boss, this.farm, this.hunt, this.bt, this.alchemy, this.uminh, this.tower, this.xh, this.garden, this.beast, this.war]) e.watchdog(Date.now()); }
+    watchdogTick() { for (const e of [this.boss, this.farm, this.hunt, this.bt, this.alchemy, this.uminh, this.tower, this.xh, this.garden, this.beast, this.meridian, this.pet, this.pvp, this.war]) e.watchdog(Date.now()); }
 
     start() {
       const { view, boss, farm, hunt } = this;
@@ -5620,8 +6179,11 @@
       this.pipeLog(this.garden, '[Linh điền]', COLORS.func8);
       this.pipeLog(this.beast, '[Yêu thú]', COLORS.func8);
       this.pipeLog(this.war, '[Tông Chiến]', COLORS.war);
+      this.pipeLog(this.meridian, '[Luyện thể]', COLORS.func6);
+      this.pipeLog(this.pet, '[Vuốt ve]', COLORS.func6);
+      this.pipeLog(this.pvp, '[Đấu pháp]', COLORS.tower);
 
-      this.bindBoss(); this.bindFarm(); this.bindHunt(); this.bindMp(); this.bindPills(); this.bindHealSkill(); this.bindSkills(); this.bindBreakthrough(); this.bindAlchemy(); this.bindUMinh(); this.bindTower(); this.bindXuatHon(); this.bindGarden(); this.bindWar(); this.bindBeast(); this.bindChest(); this.bindSell(); this.bindLogin();
+      this.bindBoss(); this.bindFarm(); this.bindHunt(); this.bindMp(); this.bindPills(); this.bindHealSkill(); this.bindSkills(); this.bindBreakthrough(); this.bindAlchemy(); this.bindUMinh(); this.bindTower(); this.bindXuatHon(); this.bindGarden(); this.bindMeridian(); this.bindPet(); this.bindPvp(); this.bindWar(); this.bindBeast(); this.bindChest(); this.bindSell(); this.bindLogin();
       view.init();
       farm.st.zone = view.zone;
       this.loadMonsters();
@@ -5730,7 +6292,7 @@
 
     bindHunt() {
       const { view, hunt } = this;
-      view.on('hunt:monster', id => { this.monsterPicked = true; hunt.st.monsterId = id; });
+      view.on('hunt:monster', id => { this.monsterPicked = true; this.monsterSaved = id; hunt.st.monsterId = id; if (id) this.storage.setRaw('tt-auto-boss-hunt-monster', String(id)); }); // yêu bạn chọn được lưu, F5 / mở lại vẫn giữ tới khi bạn đổi
       view.on('hunt:refresh', () => { this.monsterTries = 0; this.loadMonsters(); });
       hunt.on('tickets', n => view.setTickets(n)); // số vé lấy từ phản hồi của chính engine, không gọi thêm API
       this.bindToggle('hunt', hunt);
@@ -5744,11 +6306,12 @@
         const realm = me && typeof me.realm_id === 'number' ? me.realm_id : null;
         const sorted = MonsterCatalog.sort(list);
         if (!sorted.length) throw new Error('danh sách trống');
-        const keep = this.monsterPicked ? sorted.find(m => m.id === view.monsterValue && MonsterCatalog.canFight(m, realm)) : null;
+        const want = this.monsterPicked ? view.monsterValue : this.monsterSaved; // lựa chọn của bạn (đã lưu) luôn thắng mặc định; yêu chưa đủ cảnh giới thì engine báo và chờ, không tự đổi
+        const keep = want ? sorted.find(m => m.id === want) : null;
         const sel = keep || MonsterCatalog.pickDefault(sorted, realm) || sorted[0];
         view.setMonsters(sorted, realm, sel.id);
         hunt.st.monsterId = sel.id;
-        if (!keep) this.monsterPicked = false;
+        if (!keep) this.monsterPicked = false; else this.monsterPicked = true;
         this.monsterTries = 0;
         this.uiLog(`Đã tải ${sorted.length} yêu${realm != null ? ` (cảnh giới của bạn: ${realm})` : ''}. ${keep ? 'Giữ lựa chọn' : 'Mặc định'}: ${MonsterCatalog.label(sel, realm)}`);
       } catch (e) {
@@ -5781,6 +6344,20 @@
       login.on('status', (t, k) => view.setLoginStatus(t, k));
       login.on('disabled', () => { const c = { ...login.cfg }; view.setLogin(c); storage.setJSON(KEY, { enabled: false, user: c.user, pass: c.pass }); });
       setInterval(() => { try { login.step(); } catch (_) {} }, 1000);
+    }
+
+    // đấu pháp: số trận + chênh cấp (lưu localStorage), nút bật/tắt, dòng trạng thái
+    bindPvp() {
+      const { view, pvp, storage } = this;
+      const KEY = 'tt-auto-boss-pvp';
+      const apply = c => { pvp.st.target = c.count; pvp.st.levelGap = c.gap; };
+      const saved = storage.getJSON(KEY, null);
+      if (saved) view.setPvpCfg(saved);
+      apply(view.pvpCfg());
+      view.on('pvp:cfg', c => { apply(c); view.setPvpCfg(c); storage.setJSON(KEY, c); });
+      pvp.on('status', t => view.setPvpStatus(t));
+      this.bindToggle('pvp', pvp, () => { apply(view.pvpCfg()); view.setPvpStatus(''); });
+      pvp.on('stop', () => view.setPvpStatus(pvp.summary()));
     }
 
     // leo tháp: nút bật/tắt + dòng trạng thái (tầng, thắng, thua liên tiếp)
@@ -5838,7 +6415,7 @@
       const SWAP_KEY = 'tt-auto-boss-autoswap';
       const on = storage.getRaw(SWAP_KEY) !== '0';
       swapper.enabled = on; view.setAutoSwap(on);
-      const POOL_KEY = 'tt-auto-boss-swap-pool', LOCK_KEY = 'tt-auto-boss-swap-lock';
+      const POOL_KEY = 'tt-auto-boss-swap-pool', POOL2_KEY = 'tt-auto-boss-swap-pool2', LOCK_KEY = 'tt-auto-boss-swap-lock';
       const ids = k => (storage.getJSON(k, null) || []).filter(n => Number.isFinite(n));
       // game đổi cách quản lý chiêu: id chiêu giờ là item_id (trước là id túi đồ, không quy đổi lại được) → xóa ô dự bị / khóa cũ, bạn chọn lại
       const IDV_KEY = 'tt-auto-boss-skill-idv';
@@ -5847,28 +6424,31 @@
         storage.setJSON(POOL_KEY, []); storage.setJSON(LOCK_KEY, []); storage.setRaw(IDV_KEY, '2');
         if (had) setTimeout(() => this.uiLog('Game đã đổi cách quản lý chiêu thức: ô dự bị và chiêu khóa 🔒 cũ đã được xóa, hãy chọn lại ở tab Hành trang.'), 1500);
       }
-      swapper.pool = new Set(ids(POOL_KEY)); swapper.locked = new Set(ids(LOCK_KEY));
-      view.on('swap:pool', list => { swapper.pool = new Set(list); storage.setJSON(POOL_KEY, [...swapper.pool]); this.renderSkills(); this.uiLog(swapper.pool.size ? `Chiêu dùng để thay: ${[...swapper.pool].map(id => (this.skillInv.find(x => x.id === id) || {}).name || '#' + id).join(', ')}.` : 'Chiêu dùng để thay: để trống → dùng mọi chiêu đang sở hữu.'); });
+      // v2.46: ô dự bị mới (mỗi hệ 1 chiêu công kích + 1 hồi máu); 3 ô dự bị cũ (khóa POOL_KEY) bị bỏ, bạn chọn lại
+      const hadOldPool = ids(POOL_KEY).length > 0 && storage.getJSON(POOL2_KEY, null) == null;
+      if (hadOldPool) { storage.setJSON(POOL_KEY, []); setTimeout(() => this.uiLog('Chiêu dự bị đã đổi cách dùng: mỗi hệ 1 chiêu công kích + 1 chiêu hồi máu, cố định. Ô dự bị cũ đã xóa, hãy chọn lại 6 ô ở tab Hành trang.'), 1500); }
+      swapper.pool = SkillCatalog.normPool(storage.getJSON(POOL2_KEY, null)); swapper.locked = new Set(ids(LOCK_KEY));
+      view.on('swap:pool', (k, id) => {
+        swapper.pool[k] = id; storage.setJSON(POOL2_KEY, swapper.pool); this.renderSkills();
+        const it = this.skillInv.find(x => x.id === id);
+        this.uiLog(`Chiêu dự bị ${k === 'heal' ? 'hồi máu' : 'hệ ' + k}: ${id ? `"${it ? it.name : '#' + id}"` : 'để trống (không đổi cho hệ này)'}.`);
+      });
       view.on('skill:lock', id => {
         if (swapper.locked.has(id)) swapper.locked.delete(id); else swapper.locked.add(id);
         storage.setJSON(LOCK_KEY, [...swapper.locked]); this.renderSkills();
         const it = this.skillInv.find(x => x.id === id);
         this.uiLog(`${swapper.locked.has(id) ? 'Khóa' : 'Mở khóa'} chiêu "${it ? it.name : '#' + id}" (tự đổi chiêu ${swapper.locked.has(id) ? 'sẽ không tháo chiêu này' : 'được tháo lại'}).`);
       });
-      view.on('swap:toggle', v => { swapper.enabled = v; storage.setRaw(SWAP_KEY, v ? '1' : '0'); this.uiLog(`${v ? 'Bật' : 'Tắt'} tự đổi chiêu khắc hệ (chỉ trước boss).`); });
+      view.on('swap:toggle', v => { swapper.enabled = v; storage.setRaw(SWAP_KEY, v ? '1' : '0'); this.uiLog(`${v ? 'Bật' : 'Tắt'} tự đổi chiêu khắc hệ (trước boss, săn yêu, tầm bảo).`); });
       swapper.on('change', (inv, slots) => { this.skillSigBase = null; if (Array.isArray(inv)) { this.skillInv = inv; if (slots > 0) this.skillSlots = slots; this.renderSkills(); } });
-      // tool tự đổi chiêu xong: ô dự bị chứa chiêu vừa gắn đổi thành chiêu vừa tháo
-      swapper.on('pool', rot => { storage.setJSON(POOL_KEY, rot.pool); this.logRotate(rot, 'Tool đổi chiêu'); });
       // quét định kỳ: nếu bộ chiêu trong game khác với thông tin trên tool (bạn đổi tay ngoài game) thì xử lý như trên
       this.skillSigBase = null; this.scanBusy = false;
       this.reconcile = async () => {
         const book = await this.api.getSkillBook(), inv = book.skills; this.skillSlots = book.slots;
         const prevEq = SkillCatalog.equipped(this.skillInv), newEq = SkillCatalog.equipped(inv);
-        const rot = SkillCatalog.rotateByDiff(prevEq, newEq, [...swapper.pool], swapper.locked);
         const changed = prevEq.map(x => x.id).sort().join() !== newEq.map(x => x.id).sort().join();
         this.skillInv = inv;
-        if (rot.changes.length) { swapper.pool = new Set(rot.pool); storage.setJSON(POOL_KEY, rot.pool); this.logRotate(rot, 'Phát hiện bạn đổi chiêu ngoài tool'); }
-        else if (changed) this.uiLog('Phát hiện bộ chiêu trong game đã đổi ngoài tool, đã cập nhật lại danh sách (ô dự bị không bị ảnh hưởng).');
+        if (changed) this.uiLog('Phát hiện bộ chiêu trong game đã đổi ngoài tool, đã cập nhật lại danh sách (ô dự bị không bị ảnh hưởng).');
         this.renderSkills();
       };
       setInterval(() => this.scanSkills(), CFG.SKILL_SCAN_MS);
@@ -5879,11 +6459,6 @@
       view.on('skill:equip', id => this.changeSkill('equip', id));
     }
 
-    logRotate(rot, who) {
-      const nm = x => `"${x.name}"`;
-      this.uiLog(`${who}: ô dự bị ${rot.changes.map(c => `${nm(c.from)} → ${nm(c.to)}`).join(', ')}.`);
-      this.renderSkills();
-    }
     static skillSig(list) { return (list || []).map(s => s.name || ('#' + s.id)).sort().join('|'); }
     async scanSkills() {
       if (this.scanBusy || this.skillBusy || this.swapper.busy || !this.skillInv.length || !this.api.getSkills) return;
@@ -6058,6 +6633,28 @@
       this.bindToggle('garden', garden);
     }
 
+    // Vuốt ve yêu thú
+    bindPet() {
+      const { view, pet } = this;
+      pet.on('status', t => view.setPetStatus(t));
+      pet.on('stop', () => view.setPetStatus(''));
+      this.bindToggle('pet', pet);
+    }
+
+    // Luyện thể: mạch đang chọn được nhớ
+    bindMeridian() {
+      const { view, meridian, storage } = this;
+      const KEY = 'tt-auto-boss-mer-mai';
+      const saved = storage.getJSON(KEY, null);
+      if (Number.isInteger(saved) && MeridianCatalog.MAI[saved]) meridian.st.mai = saved;
+      view.setMeridianMai(meridian.st.mai);
+      view.on('meridian:mai', id => { meridian.st.mai = id; storage.setJSON(KEY, id); this.uiLog(id == null ? 'Luyện thể: bỏ chọn mạch.' : `Luyện thể: chọn mạch ${MeridianCatalog.MAI[id].name}.`); });
+      meridian.on('info', t => view.setMeridianInfo(t));
+      meridian.on('status', t => view.setMeridianStatus(t));
+      meridian.on('stop', () => { view.setMeridianStatus(''); });
+      this.bindToggle('meridian', meridian);
+    }
+
     // Tông Chiến: lãnh địa đang chọn tay được nhớ cùng hạn (20:55); hết hạn thì bỏ
     bindWar() {
       const { view, war, storage } = this;
@@ -6066,7 +6663,7 @@
       if (c && typeof c.code === 'string' && Number(c.until) > Date.now()) war.st.choice = { code: c.code, until: Number(c.until) };
       view.on('war:terr', v => war.setChoice(v === 'auto' ? null : v));
       war.on('choice', ch => storage.setJSON(KEY, ch));
-      war.on('territories', (list, code, chosen) => view.setWarTerritories(list, code, chosen));
+      war.on('territories', (list, code, chosen, sectId) => view.setWarTerritories(list, code, chosen, sectId));
       war.on('info', t => view.setWarInfo(t));
       war.on('status', t => view.setWarStatus(t));
       war.on('stop', () => { view.setWarStatus(''); });
