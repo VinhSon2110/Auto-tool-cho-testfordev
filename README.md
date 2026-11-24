@@ -1,45 +1,1099 @@
-# Auto-tool-cho-testfordev.online
-KIẾN TRÚC (cập nhật tới v2.45.2). Thứ tự trong file đi từ lớp thuần tới lớp phụ thuộc DOM / mạng:
- 
-   1. Domain (thuần, không side-effect)  : ElementRules, SkillSelector, CombatFormatter, BossCatalog (chọn boss + chế độ nâng cao theo cỡ boss: full / min70 / dmg50 / dmg25), MonsterCatalog, PillCatalog, AlchemyCatalog,
-                                           SkillCatalog (sách chiêu; đọc định dạng mới skill_id + effects[] và suy ra skill_kind / mp_cost / hệ cho phần còn lại),
-                                           GardenCatalog, UMinhPlanner (tìm bước đi U Minh Cốc)
-   2. Hạ tầng                            : EventEmitter, StateMachine, RateLimiter, Coordinator (cờ ưu tiên + skillGate), PillBook (đan đang chọn + tồn kho),
-                                           cấu hình theo từng chế độ (đọc trực tiếp, UI sửa tại chỗ): HpPillConfig (đan hồi HP), MpPillConfig (đan hồi MP),
-                                           HealSkillConfig (mức dùng chiêu hồi máu), MpGate / HpGate (ngưỡng tạm dừng / chạy tiếp của tầm bảo, săn yêu, leo tháp, U Minh Cốc);
-                                           PillConfig (cấu hình dự phòng cho nút "Hồi MP ngay"),
-                                           RequestQueue (hàng chờ lệnh gọi game: hai lệnh cách nhau >= REQ_GAP_MS (~1s), 3 mức ưu tiên + nâng mức khi chờ lâu, gộp GET trùng, dừng khi server báo gọi quá nhiều)
-   3. Dịch vụ dùng chung                 : Healer (dưỡng thương), PillManager (đan hồi MP theo chế độ + nút Hồi MP ngay), HpPillService (đan hồi HP theo chế độ + nút Hồi HP ngay),
-                                           SkillSwapper (tự đổi chiêu khắc hệ, chỉ trước boss)
-   4. Engine (mỗi chế độ = 1 class)      : Engine (abstract)
-                                             ├─ BossEngine, BreakthroughEngine, AlchemyEngine, BeastEngine, GardenEngine, XuatHonEngine, WarEngine (Tông Chiến, vòng lặp thường, không dùng MatchEngine)
-                                             └─ MatchEngine (khung trận đánh dùng chung: waitGate = ngưỡng HP / MP trước khi mở trận hoặc vào U Minh, waitMp = hết MP giữa trận)
-                                                → FarmEngine (tầm bảo), HuntEngine (săn yêu), TowerEngine (leo tháp), UMinhEngine (U Minh Cốc)
-        Đi kèm trong phần này: WarCatalog (chọn lãnh địa, lọc mục tiêu, mốc xx:25 và 20:55), BreakthroughCatalog, BeastCatalog, XuatHonCatalog, AutoLogin, ModeMemory (nhớ chế độ để tự bật lại), BulkUseCatalog / BulkUseEngine (mở nhiều), SellCatalog / SellEngine (bán đồ)
-        - Engine KHÔNG đụng DOM: chỉ phát sự kiện 'log' | 'start' | 'stop' | 'state' | 'status' | 'tickets' (và vài sự kiện riêng của từng chế độ)
-        - Vòng lặp chính và vòng lặp trận đánh là các StateMachine (bảng chuyển trạng thái khai báo rõ ràng, vd. XuatHonEngine.TRANSITIONS)
-        - Mọi lỗi đều không tự tắt chế độ: chờ lùi 10 / 20 / 30s rồi 120s (boss cố định 2s, đột phá cố định 5s)
-   5. Hạ tầng mạng                       : GameApi (bắt token bằng hook fetch / XHR, gọi REST; MỌI lệnh đi qua RequestQueue, mức ưu tiên chọn theo đường dẫn;
-                                           mỗi lệnh có giới hạn HTTP_TIMEOUT_MS, quá hạn thì thành lỗi để cơ chế lùi / watchdog xử lý, không để chế độ đứng im)
-   6. UI                                 : PanelView (DOM thuần, phát sự kiện ý định của người dùng), DualSlider (thanh trượt đôi), SingleSlider (thanh đơn "Hồi ngay"), SafeStorage
-        - Hai giao diện dùng chung một bộ phần tử và id: giao diện máy tính (bảng nổi, kéo được) và giao diện màn hình nhỏ cảm ứng
-          (class "cp": ngăn kéo bên phải + thanh thu gọn + thẻ chế độ + trang cài đặt riêng; dải trạng thái hiện mỗi chế độ đang chạy thành một nút, chạm để tắt; ngưỡng HP / MP của từng chế độ nằm trong mục gập "Ngưỡng HP / MP · hồi máu"; vùng chạm tối thiểu 44px). Tự chọn theo độ rộng màn (<= 1100px), nút ở thanh tiêu đề để đổi tay
-        - Bốn bộ "ô tích + thanh trượt đôi x% – y%" theo từng chế độ (đan hồi HP, đan hồi MP, ngưỡng MP, ngưỡng HP) khai báo trong DUAL_SPECS, dựng HTML, nối sự kiện (<ev>:toggle, <ev>:range) và đặt giá trị bằng cùng một mã (dual / showDual / setDual)
-        - Tab Hành trang, mục "Đan": chọn loại đan HP / MP, thanh "Hồi ngay" dùng chung cho nút "Hồi MP ngay" và "Hồi HP ngay"
-   7. App (controller)                   : nối engine <-> view bằng sự kiện (các hàm bind*; bindDual nạp / lưu / nối sự kiện cho 4 bộ trên, có chuyển dữ liệu cũ), lệnh đổi chiêu chờ (queueSkill / flushSkillQueue), điều kiện chạy của xuất hồn (xhBlockers)
- 
-   THỨ TỰ ƯU TIÊN (Coordinator): đột phá > boss > U Minh Cốc > săn yêu > leo tháp > tầm bảo > xuất hồn.
-   - Boss chiếm 3 phút đầu mỗi giờ; đột phá chen vào giữa các trận (btPause) và có thể đợi trận đang dở.
-   - Còn boss và đang bật chế độ boss (coord.bossPending): U Minh Cốc không vào và không mở lượt mới, vì trong U Minh HP, MP không tự hồi theo thời gian (đan vẫn dùng được).
-   - Chế độ nâng cao của từng cỡ boss (BossEngine.st.modes, lưu localStorage, mặc định full = đánh tới cùng):
-       min70 = chỉ đánh khi boss còn >= 70% HP: xét cả lúc vào lẫn trước mỗi đòn (sCheck), tụt dưới 70% là dừng ngay kể cả đang đánh, không phụ thuộc F5;
-       dmg50 / dmg25 = sát thương của bạn (myDamage) đạt 50% / 25% hp_max thì tạm dừng (st.paused), nhả coord.boss cho các chế độ khác, quét boss chờ còn <= BossCatalog.LAST_HIT (2,5% HP) rồi đánh tiếp để giành last hit. Chờ tối đa BOSS_LASTHIT_WAIT_MS thì bỏ boss đó (st.gaveUp).
-       Lúc chờ, coord.bossPending vẫn bật nên U Minh Cốc không vào; các chế độ khác chạy. Tần suất quét: trên 30% HP mỗi 10s, 10-30% mỗi 3s, dưới 10% mỗi 2s.
-      Đang đánh boss khác mà boss chờ last hit tới mốc thì sCheck (3s một lần) nhường và pick chọn boss đó trước.
-   - U Minh Cốc, tầm bảo, xuất hồn không chạy song song nhau (quy tắc game). Xuất hồn chỉ bắt đầu khi U Minh Cốc đã đi xong (hoặc tắt) và tầm bảo hết vé (hoặc tắt); xuất hồn đang chạy dở mà U Minh Cốc / tầm bảo cần vào thì BỎ lượt đó (abandon, mất thưởng). Xuất hồn không đụng tới boss / săn yêu / leo tháp.
-   - Ngưỡng HP / MP (mỗi chế độ, mỗi ngưỡng một ô bật / tắt): HP hoặc MP <= mức tạm dừng thì không mở trận mới (U Minh Cốc: không vào); dùng đan của chế độ đó (nếu bật) tới ít nhất mức chạy tiếp, không có đan thì chờ tự hồi, kiểm tra lại mỗi 2 phút, chạy tiếp khi vượt mức chạy tiếp. Boss không có ngưỡng này.
-   - Đổi chiêu: lệnh bị hoãn khi đang trong trận; các chế độ gọi coord.skillGate() giữa hai trận để đổi ngay trước khi mở trận mới.
-   - Tự đổi chiêu khắc hệ (SkillSwapper + SkillCatalog.plan) chỉ chạy trước boss: bộ chiêu đang gắn đã có chiêu công kích khắc thì giữ nguyên; nếu chưa có thì mới tìm trong chiêu dự bị (ô "Chiêu dùng để thay"), trống thì không tìm. Đổi tối thiểu (còn ô trống chỉ gắn thêm, hết ô thì tháo 1 chiêu yếu nhất rồi gắn); gắn lỗi sau khi đã tháo thì gắn lại chiêu vừa tháo. Leo tháp không đổi chiêu.
-   - Tông Chiến (WarEngine, chỉ chạy khi bật; trận mô phỏng nên không đụng HP thật, không xung đột với các chế độ khác): trước gatherAt chờ; từ gatherAt đổi chiêu một lần (SkillSwapper.ensureWar + SkillCatalog.planWar: 1 chiêu hồi máu mạnh nhất + các chiêu công kích mạnh nhất, vì server chụp bộ chiêu lúc POST garrison và khóa tới hết sự kiện, đổi giữa trận vô ích) rồi vào lãnh địa; trong khung liveStartAt - liveEndAt mỗi lượt: người chơi khác tông có power <= CFG.WAR_MAX_POWER (không giới hạn lượt, yếu nhất trước)> thủ vệ (guard.remaining > 0, tối đa 5 lần thắng) > chờ người chơi xuất hiện. Một lượt = POST attack mở trận + POST match/action lặp tới finished. Chờ nextActionAt / woundedUntil giữa các lượt; dừng khi hết giờ live hoặc attacksMade >= limits.maxAttacks. Lãnh địa: chỉ liệt kê lãnh địa tông đã đăng ký, mặc định vòng cao trước (center > middle > outer), quét khi bật và mỗi xx:25; lựa chọn tay được giữ tới 20:55 rồi về mặc định (lưu localStorage). Đã garrison thì lãnh địa lấy từ me.garrison.
-   - Hàng chờ lệnh (RequestQueue): ưu tiên 0 = boss, đột phá, đổi chiêu; 1 = tầm bảo, săn yêu, leo tháp, U Minh Cốc, Tông Chiến, thông tin nhân vật; 2 = việc nền (bán đồ, mở rương, ấp trứng...).
- *    Lệnh chờ quá REQ_AGING_MS thì được nâng một mức. Gặp 429 / "too many requests": dừng hàng REQ_PAUSE_MS rồi gửi lại đúng 1 lần.
+# Kiến trúc hệ thống (v2.56.0)
+
+## Mục lục
+
+- #1-domain-layer
+- #2-infrastructure-layer
+- #3-shared-services
+- #4-engine-layer
+  - #41-engine-cơ-sở
+  - #42-matchengine
+  - #43-catalog--engine-phụ-trợ
+  - #44-nguyên-tắc-vận-hành
+- #5-network-layer
+- #6-ui-layer
+- #7-application-layer
+- #8-coordinator-priority
+- #9-tông-chiến
+- #10-đấu-pháp-pvpengine
+- #11-boss-engine
+- #12-chế-độ-boss-nâng-cao
+- #13-u-minh---tầm-bảo---xuất-hồn
+- #14-hpmp-gate
+- #15-skill-queue--skill-gate
+- #16-tự-động-đổi-chiêu-khắc-hệ
+- #17-warengine-tông-chiến
+- #18-requestqueue
+
+---
+
+# 1. Domain Layer
+
+Business logic thuần, không side-effect.
+
+## Thành phần
+
+### ElementRules
+
+Quy tắc khắc hệ.
+
+### SkillSelector
+
+Lựa chọn bộ chiêu phù hợp.
+
+### CombatFormatter
+
+Chuẩn hóa dữ liệu trận đánh.
+
+### BossCatalog
+
+Quản lý dữ liệu Boss:
+
+- Danh sách boss
+- Chọn boss
+- Chế độ nâng cao:
+  - `full`
+  - `min70`
+  - `dmg50`
+  - `dmg25`
+
+### MonsterCatalog
+
+Quản lý dữ liệu quái.
+
+### PillCatalog
+
+Quản lý dữ liệu đan dược.
+
+### AlchemyCatalog
+
+Quản lý công thức và dữ liệu luyện đan.
+
+### SkillCatalog
+
+Quản lý toàn bộ sách chiêu.
+
+Đọc định dạng mới:
+
+```js
+{
+  skill_id,
+  effects:[]
+}
+```
+
+Suy luận:
+
+- `skill_kind`
+- `mp_cost`
+- `element`
+
+### GardenCatalog
+
+Quản lý dữ liệu dược điền.
+
+### UMinhPlanner
+
+Thuật toán tìm đường trong U Minh Cốc.
+
+---
+
+# 2. Infrastructure Layer
+
+Các thành phần nền tảng dùng chung.
+
+## EventEmitter
+
+Cơ chế pub/sub nội bộ.
+
+## StateMachine
+
+Khung quản lý trạng thái.
+
+## RateLimiter
+
+Giới hạn tốc độ thao tác.
+
+## Coordinator
+
+Bộ điều phối trung tâm.
+
+Quản lý:
+
+- Quyền ưu tiên
+- Skill Gate
+- Boss Lock
+- PvP Lock
+- Điều phối chế độ
+
+## PillBook
+
+Quản lý:
+
+- Đan đang chọn
+- Tồn kho
+- Loại đan sử dụng
+
+## Runtime Configuration
+
+### HpPillConfig
+
+Đan hồi HP.
+
+### MpPillConfig
+
+Đan hồi MP.
+
+### HealSkillConfig
+
+Ngưỡng dùng kỹ năng hồi máu.
+
+### HpGate
+
+Ngưỡng HP:
+
+- Dừng
+- Tiếp tục
+
+### MpGate
+
+Ngưỡng MP:
+
+- Dừng
+- Tiếp tục
+
+### PillConfig
+
+Cấu hình dùng cho nút:
+
+```text
+Hồi MP ngay
+```
+
+---
+
+# 3. Shared Services
+
+## Healer
+
+Dưỡng thương tự động.
+
+## PillManager
+
+Quản lý đan hồi MP.
+
+Chức năng:
+
+- Tự dùng đan
+- Hồi MP ngay
+
+## HpPillService
+
+Quản lý đan hồi HP.
+
+Chức năng:
+
+- Tự dùng đan
+- Hồi HP ngay
+
+## SkillSwapper
+
+Tự động đổi chiêu.
+
+Áp dụng cho:
+
+- Boss
+- Tầm bảo
+- Săn yêu
+
+---
+
+# 4. Engine Layer
+
+Mỗi chế độ tương ứng một engine độc lập.
+
+---
+
+## 4.1. Engine cơ sở
+
+```text
+Engine (abstract)
+```
+
+### Engine độc lập
+
+- BossEngine
+- BreakthroughEngine
+- AlchemyEngine
+- BeastEngine
+- GardenEngine
+- XuatHonEngine
+
+### MeridianEngine
+
+Luyện thể:
+
+- Chạy nền
+- Chạy liên tục
+- Tự chọn huyệt rẻ nhất
+
+### PetEngine
+
+- Vuốt ve yêu thú xuất chiến
+- Chờ hồi 1 giờ
+
+### WarEngine
+
+- Tông Chiến
+- Không sử dụng MatchEngine
+
+---
+
+## 4.2. MatchEngine
+
+Khung chiến đấu dùng chung.
+
+```text
+MatchEngine
+├─ FarmEngine
+├─ HuntEngine
+├─ TowerEngine
+├─ UMinhEngine
+└─ PvpEngine
+```
+
+### waitGate
+
+Kiểm tra:
+
+- HP
+- MP
+
+trước khi mở trận hoặc vào U Minh.
+
+### waitMp
+
+Xử lý hết MP giữa trận.
+
+---
+
+## 4.3. Catalog & Engine phụ trợ
+
+- WarCatalog
+- BreakthroughCatalog
+- BeastCatalog
+- XuatHonCatalog
+- AutoLogin
+- ModeMemory
+- BulkUseCatalog
+- BulkUseEngine
+- SellCatalog
+- SellEngine
+
+---
+
+## 4.4. Nguyên tắc vận hành
+
+### Không thao tác DOM
+
+Engine không được phép truy cập DOM.
+
+### Chỉ phát sự kiện
+
+```text
+log
+start
+stop
+state
+status
+tickets
+```
+
+và các event riêng theo từng chế độ.
+
+### StateMachine
+
+Mọi vòng lặp:
+
+- Main loop
+- Battle loop
+
+đều dùng StateMachine.
+
+### Retry
+
+Không tự tắt chế độ khi lỗi.
+
+Backoff:
+
+```text
+10s
+→ 20s
+→ 30s
+→ 120s
+```
+
+Ngoại lệ:
+
+| Engine | Retry |
+|----------|----------|
+| Boss | 2s |
+| Breakthrough | 5s |
+
+---
+
+# 5. Network Layer
+
+## GameApi
+
+Lớp giao tiếp duy nhất với game.
+
+### Chức năng
+
+#### Hook Token
+
+Theo dõi:
+
+- fetch
+- XMLHttpRequest
+
+để lấy token.
+
+#### REST API
+
+Toàn bộ request đi qua:
+
+```text
+RequestQueue
+```
+
+#### Timeout Protection
+
+Mỗi request:
+
+```text
+HTTP_TIMEOUT_MS
+```
+
+Khi quá hạn:
+
+```text
+request → error
+```
+
+để watchdog xử lý.
+
+---
+
+# 6. UI Layer
+
+## Thành phần
+
+### PanelView
+
+Giao diện chính.
+
+Nhiệm vụ:
+
+- Render DOM
+- Nhận thao tác người dùng
+- Phát event
+
+### DualSlider
+
+Thanh trượt đôi.
+
+### SingleSlider
+
+Thanh trượt đơn.
+
+### SafeStorage
+
+Wrapper của localStorage.
+
+---
+
+## Hai giao diện
+
+### Desktop
+
+- Floating panel
+- Kéo thả
+
+### Mobile (`cp`)
+
+- Drawer bên phải
+- Thanh thu gọn
+- Mode cards
+- Settings riêng
+- Status buttons
+- Touch target ≥ 44px
+
+Chuyển tự động:
+
+```text
+width <= 1100px
+```
+
+---
+
+## DUAL_SPECS
+
+Sinh động 4 nhóm điều khiển:
+
+### Đan hồi HP
+
+```text
+Toggle + Range
+```
+
+### Đan hồi MP
+
+```text
+Toggle + Range
+```
+
+### Ngưỡng HP
+
+```text
+Toggle + Range
+```
+
+### Ngưỡng MP
+
+```text
+Toggle + Range
+```
+
+Dùng chung:
+
+```js
+dual()
+showDual()
+setDual()
+```
+
+---
+
+## Hành Trang → Đan
+
+Cho phép:
+
+- Chọn đan HP
+- Chọn đan MP
+
+Thanh:
+
+```text
+Hồi ngay
+```
+
+được dùng cho:
+
+- Hồi HP ngay
+- Hồi MP ngay
+
+---
+
+# 7. Application Layer
+
+Nối:
+
+```text
+Engine ↔ View
+```
+
+Thông qua các hàm `bind*`.
+
+## Chức năng
+
+### bindDual()
+
+- Nạp dữ liệu
+- Lưu dữ liệu
+- Chuyển dữ liệu cũ
+- Nối sự kiện
+
+### Skill Queue
+
+```js
+queueSkill()
+flushSkillQueue()
+```
+
+### Xuất Hồn
+
+```js
+xhBlockers
+```
+
+quyết định điều kiện được phép chạy.
+
+---
+
+# 8. Coordinator Priority
+
+Thứ tự ưu tiên:
+
+```text
+Breakthrough
+↓
+Boss
+↓
+UMinh
+↓
+Hunt
+↓
+Tower
+↓
+Farm
+↓
+XuatHon
+```
+
+---
+
+# 9. Tông Chiến
+
+Lãnh địa hợp lệ:
+
+- Đang chiếm (`ownerSectId`)
+- Đã đăng ký và được duyệt
+
+Thời điểm quét:
+
+- Khi bật
+- Mỗi `xx:25`
+- Khi tới giờ tập hợp
+- Mỗi phút nếu chưa thấy lãnh địa
+
+Log:
+
+- Đã sở hữu
+- Có thể chiếm
+- Bị tông khác chuẩn bị chiếm
+
+---
+
+# 10. Đấu Pháp (PvpEngine)
+
+Chạy nền ở mức ưu tiên thấp nhất.
+
+## Nhường quyền
+
+- Boss
+- Breakthrough
+- UMinh
+- Hunt
+- Tower
+- Trận Farm đang diễn ra
+
+Không nhường theo:
+
+```text
+FarmEngine đang bật nhưng hết vé
+```
+
+## Quy tắc
+
+- Chỉ challenge
+- Có Elo
+- Không phạt karma
+
+Khoảng cách:
+
+```text
+PVP_GAP_MS >= 15s
+```
+
+## Chọn mục tiêu
+
+Điều kiện:
+
+```text
+Target.level <= My.level - gap
+```
+
+Trong số đó:
+
+```text
+Chọn điểm cao nhất
+```
+
+Đủ số trận đặt trước:
+
+```text
+Tự tắt
+```
+
+Trong trận:
+
+```js
+coord.pvpBattle = true
+```
+
+Khóa:
+
+- Đổi chiêu
+- Đột phá
+
+---
+
+# 11. Boss Engine
+
+Được ưu tiên trong:
+
+```text
+3 phút đầu mỗi giờ
+```
+
+Breakthrough:
+
+- Có thể chen giữa trận
+- Có thể chờ trận hiện tại kết thúc
+
+Nếu:
+
+```js
+coord.bossPending = true
+```
+
+thì:
+
+- U Minh không được vào
+- Không mở lượt mới
+
+Lý do:
+
+Trong U Minh:
+
+- HP không tự hồi
+- MP không tự hồi
+
+---
+
+# 12. Chế độ Boss nâng cao
+
+Lưu tại:
+
+```js
+BossEngine.st.modes
+```
+
+và localStorage.
+
+---
+
+## full
+
+Đánh đến cùng.
+
+---
+
+## min70
+
+Chỉ đánh nếu:
+
+```text
+Boss HP >= 70%
+```
+
+Kiểm tra:
+
+- Lúc vào
+- Trước mỗi đòn
+
+Nếu thấp hơn:
+
+```text
+Dừng ngay
+```
+
+---
+
+## dmg50 / dmg25
+
+Khi:
+
+```text
+myDamage >= 50% hp_max
+```
+
+hoặc
+
+```text
+myDamage >= 25% hp_max
+```
+
+sẽ:
+
+```js
+st.paused = true
+```
+
+Nhả quyền boss.
+
+Chuyển sang theo dõi Last Hit.
+
+### Last Hit
+
+Ngưỡng:
+
+```text
+BossCatalog.LAST_HIT = 2.5%
+```
+
+Khi boss xuống dưới ngưỡng:
+
+```text
+Đánh tiếp
+```
+
+Timeout:
+
+```text
+BOSS_LASTHIT_WAIT_MS
+```
+
+Quá hạn:
+
+```js
+st.gaveUp = true
+```
+
+### Chu kỳ quét
+
+| HP Boss | Tần suất |
+|-----------|-----------|
+| >30% | 10s |
+| 10%-30% | 3s |
+| <10% | 2s |
+
+---
+
+# 13. U Minh - Tầm Bảo - Xuất Hồn
+
+Không được chạy đồng thời.
+
+```text
+UMinh
+Farm
+XuatHon
+```
+
+### Điều kiện chạy Xuất Hồn
+
+U Minh:
+
+```text
+Đã hoàn thành hoặc tắt
+```
+
+Farm:
+
+```text
+Hết vé hoặc tắt
+```
+
+Nếu Xuất Hồn đang chạy mà:
+
+- Farm cần vào
+- U Minh cần vào
+
+=> abandon lượt hiện tại.
+
+---
+
+# 14. HP/MP Gate
+
+Mỗi mode có:
+
+- HP Gate riêng
+- MP Gate riêng
+
+Nếu:
+
+```text
+HP <= stop threshold
+```
+
+hoặc
+
+```text
+MP <= stop threshold
+```
+
+thì:
+
+- Không mở trận mới
+- U Minh không được vào
+
+### Phục hồi
+
+1. Dùng đan
+2. Nếu hết đan:
+   - Chờ hồi tự nhiên
+3. Kiểm tra mỗi 2 phút
+4. Khi vượt continue threshold:
+   - Chạy tiếp
+
+Boss không áp dụng.
+
+---
+
+# 15. Skill Queue & Skill Gate
+
+Trong combat:
+
+```text
+Không đổi chiêu
+```
+
+Mọi yêu cầu đổi chiêu đi vào:
+
+```js
+queueSkill()
+```
+
+Được thực thi thông qua:
+
+```js
+flushSkillQueue()
+```
+
+và:
+
+```js
+coord.skillGate()
+```
+
+khi trận kết thúc.
+
+---
+
+# 16. Tự động đổi chiêu khắc hệ
+
+Triển khai bởi:
+
+- SkillSwapper
+- SkillCatalog.plan()
+
+Áp dụng:
+
+- Boss
+- Hunt
+- Farm
+- U Minh
+
+Không áp dụng:
+
+- Tower
+- U Minh Cốc nội chiến
+- War
+
+## Nguồn hệ mục tiêu
+
+### U Minh
+
+```js
+CFG.UM_ELEMENT_BY_REALM
+```
+
+### Farm
+
+Monster có:
+
+```text
+monsterId lớn nhất
+```
+
+trong bí cảnh.
+
+API:
+
+```text
+/api/dungeon/farm/zones/<code>/monsters
+```
+
+## Triết lý đổi chiêu
+
+Nếu đã có chiêu khắc:
+
+```text
+Giữ nguyên
+```
+
+Nếu chưa có:
+
+```text
+Tìm trong ô dự bị
+```
+
+### Slot dự bị
+
+- Kim
+- Mộc
+- Thủy
+- Hỏa
+- Thổ
+- Heal
+
+### Đổi tối thiểu
+
+Ưu tiên:
+
+1. Gắn vào ô trống
+2. Nếu đầy:
+   - Tháo chiêu yếu nhất
+   - Gắn chiêu mới
+
+Nếu lỗi:
+
+```text
+Khôi phục chiêu cũ
+```
+
+---
+
+# 17. WarEngine (Tông Chiến)
+
+Hoạt động độc lập.
+
+Không sử dụng HP thật.
+
+Không xung đột với mode khác.
+
+## Trước tập hợp
+
+```text
+Chờ gatherAt
+```
+
+## Đến giờ tập hợp
+
+Đổi chiêu 1 lần:
+
+```js
+SkillSwapper.ensureWar()
+SkillCatalog.planWar()
+```
+
+Nguyên tắc:
+
+- Heal mạnh nhất ×1
+- Damage mạnh nhất ×N
+
+Server lock bộ chiêu tại:
+
+```text
+POST garrison
+```
+
+nên đổi sau đó không còn tác dụng.
+
+### Ưu tiên mục tiêu
+
+```text
+Enemy Player
+↓
+Guard
+↓
+Wait
+```
+
+Điều kiện:
+
+```text
+power <= CFG.WAR_MAX_POWER
+```
+
+Ưu tiên:
+
+```text
+Yếu nhất trước
+```
+
+### Một lượt
+
+```text
+POST attack
+↓
+POST match/action
+↓
+finished
+```
+
+### Điều kiện dừng
+
+- Hết thời gian live
+- Đạt maxAttacks
+
+### Chọn lãnh địa
+
+Ưu tiên:
+
+```text
+Chưa có
+↓
+Center
+↓
+Middle
+↓
+Outer
+```
+
+---
+
+# 18. RequestQueue
+
+Mọi request game đi qua đây.
+
+## Priority
+
+### P0 (Critical)
+
+- Boss
+- Breakthrough
+- Skill Swap
+
+### P1 (Gameplay)
+
+- Farm
+- Hunt
+- Tower
+- U Minh
+- War
+- Character Info
+
+### P2 (Background)
+
+- Bán đồ
+- Mở rương
+- Ấp trứng
+- Tác vụ nền
+
+---
+
+## Aging
+
+Nếu request chờ quá:
+
+```text
+REQ_AGING_MS
+```
+
+sẽ được nâng một mức ưu tiên.
+
+---
+
+## Anti Rate Limit
+
+Nếu gặp:
+
+- HTTP 429
+- "too many requests"
+
+thì:
+
+1. Pause queue (`REQ_PAUSE_MS`)
+2. Retry đúng 1 lần
